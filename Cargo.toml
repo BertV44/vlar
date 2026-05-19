@@ -8,7 +8,7 @@ authors = [
 description = "High-performance anonymization tool for Veeam Backup & Replication logs (community project, aligned with Veeam KB2462 — no official support)"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/JMousqueton/VeeamLogAnonymizer"
+repository = "https://github.com/BertV44/vlar"
 keywords = ["veeam", "anonymization", "logs", "privacy", "security"]
 categories = ["command-line-utilities"]
 

@@ -99,7 +99,7 @@ cargo build --release
 
 ### Pre-built binaries
 
-Download from the [Releases](https://github.com/JMousqueton/VeeamLogAnonymizer/releases) page. Builds available for Linux (x86_64, ARM64), macOS (Intel, Apple Silicon), and Windows.
+Download from the [Releases](https://github.com/BertV44/vlar/releases) page. Builds available for Linux (x86_64, ARM64), macOS (Intel, Apple Silicon), and Windows.
 
 ## Usage
 
