@@ -1,36 +1,42 @@
 [package]
 name = "veeam-log-anonymizer"
-version = "1.0.0"
+version = "2.4.0"
 edition = "2021"
-description = "High-performance log anonymization tool for Veeam Backup & Replication"
+authors = [
+    "Bertrand Castagnet <EMEA TAM at Veeam France>",
+]
+description = "High-performance anonymization tool for Veeam Backup & Replication logs (community project, aligned with Veeam KB2462 — no official support)"
 license = "MIT"
 readme = "README.md"
-keywords = ["veeam", "anonymizer", "logs", "privacy", "gdpr"]
-categories = ["command-line-utilities", "text-processing"]
+repository = "https://github.com/JMousqueton/VeeamLogAnonymizer"
+keywords = ["veeam", "anonymization", "logs", "privacy", "security"]
+categories = ["command-line-utilities"]
 
 [dependencies]
-clap = { version = "4.4", features = ["derive", "env"] }
+clap = { version = "4.4", features = ["derive"] }
 regex = "1.10"
 rayon = "1.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rand = "0.8"
 chrono = "0.4"
-thiserror = "1.0"
 walkdir = "2.4"
+anyhow = "1.0"
 indicatif = { version = "0.17", features = ["rayon"] }
-lazy_static = "1.4"
-log = "0.4"
-env_logger = "0.10"
-memmap2 = "0.9"
+encoding_rs = "0.8"
 aho-corasick = "1.1"
+
+[dev-dependencies]
+tempfile = "3.10"
 
 [profile.release]
 lto = true
 codegen-units = 1
 opt-level = 3
 strip = true
-panic = "abort"
 
 [profile.dev]
+opt-level = 1
+
+[profile.test]
 opt-level = 1
