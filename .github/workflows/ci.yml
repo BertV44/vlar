@@ -1,0 +1,145 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: veeam-log-anonymizer
+
+jobs:
+  # ─── Lint & Test ─────────────────────────────────────────
+  check:
+    name: Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --verbose
+
+  # ─── Cross-platform builds ──────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (static with musl)
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: veeam-log-anonymizer-linux-x86_64
+            cross: true
+
+          # Linux aarch64 (ARM64, e.g. Raspberry Pi 4)
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: veeam-log-anonymizer-linux-aarch64
+            cross: true
+
+          # macOS x86_64 (Intel)
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: veeam-log-anonymizer-macos-x86_64
+            cross: false
+
+          # macOS aarch64 (Apple Silicon)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: veeam-log-anonymizer-macos-aarch64
+            cross: false
+
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: veeam-log-anonymizer-windows-x86_64
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/
+          chmod +x dist/${{ env.BINARY_NAME }}
+          cd dist && tar czf ../${{ matrix.artifact }}.tar.gz ${{ env.BINARY_NAME }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" dist/
+          Compress-Archive -Path "dist/${{ env.BINARY_NAME }}.exe" -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.*
+
+  # ─── GitHub Release (on tag push) ───────────────────────
+  release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/**/*
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') }}
