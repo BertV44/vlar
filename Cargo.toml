@@ -1,6 +1,6 @@
 [package]
 name = "veeam-log-anonymizer"
-version = "2.5.0"
+version = "2.6.0"
 edition = "2021"
 authors = [
     "Bertrand Castagnet <EMEA TAM at Veeam France>",
@@ -25,9 +25,13 @@ anyhow = "1.0"
 indicatif = { version = "0.17", features = ["rayon"] }
 encoding_rs = "0.8"
 aho-corasick = "1.1"
+zip = "8.6.0"
+age = "0.11.3"
+rpassword = "7.5.3"
 
 [dev-dependencies]
 tempfile = "3.10"
+zip = "8.6.0"
 
 [profile.release]
 lto = true

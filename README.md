@@ -61,6 +61,57 @@ This tool's detection scope follows the categories listed in [KB2462](https://ww
 - **Flexible**: Exclude specific entity types with `--exclude`, opt-in aggressive detection with `--aggressive`
 - **Safe**: Paranoid re-scan mode + collision detection on generated values
 
+## What's new in v2.6
+
+Three backlog features, all shipped together.
+
+### `--validate-only` — dry-run audit with a JSON report
+
+Scan a bundle **without writing anything** and emit a machine-readable JSON report of what
+*would* be anonymized — counts by entity kind and by file, **never the original values**.
+Built for pipelines / agent orchestration.
+
+- Output to stdout (pure JSON — banner and progress go to stderr) or to `--report-output FILE`.
+- **Deterministic exit code**: `0` if no entities detected, `2` if entities were detected,
+  `1` on error.
+- Reuses the exact same detection engine as anonymization (no logic drift).
+
+```bash
+veeam-log-anonymizer -d ./logs --validate-only | jq .summary
+veeam-log-anonymizer -d bundle.zip --validate-only --report-output audit.json
+```
+
+### Direct `.zip` bundle input
+
+Point `-d` at a support `.zip` directly (auto-detected by extension / PK magic bytes) — no
+manual decompression.
+
+- `--output-zip FILE` repacks an anonymized `.zip` (what you send back to support), preserving
+  the internal tree and entry timestamps. Otherwise the bundle is extracted, anonymized, into
+  `-o DIR`.
+- `.log` entries get their content anonymized; other entries are copied byte-for-byte; **every
+  entry name** is anonymized (path-safe entities). Processed entry-by-entry (memory bounded).
+- The **dictionary is never written inside the zip**.
+
+```bash
+veeam-log-anonymizer -d 2026-05-16_VeeamBackupLogs.zip --output-zip anonymized.zip -f -D --dict-output ./keep-safe
+```
+
+### Optional dictionary encryption (`--encrypt-dict`)
+
+Opt-in encryption of the reversible dictionary (a credential) with a passphrase, using the
+[`age`](https://age-encryption.org/) format. Output gets a `.age` suffix.
+
+- Passphrase from `VLAR_DICT_PASSPHRASE` (automation) or an interactive hidden prompt — **never**
+  a CLI argument.
+- `--reverse` transparently decrypts a `.age` dictionary (prompts / reads the env var).
+- Losing the passphrase means the anonymization can never be reversed.
+
+```bash
+veeam-log-anonymizer -d ./logs -o ./out -f -D --dict-output ./keep-safe --encrypt-dict
+veeam-log-anonymizer --reverse ./keep-safe/veeam-anonymizer-*.json.age -d ./out -o ./restored -f
+```
+
 ## What's new in v2.5
 
 ### File & directory name anonymization
@@ -203,8 +254,9 @@ veeam-log-anonymizer -d ./logs -o ./output -f -e pem
 | Flag | Long | Description |
 |---|---|---|
 | `-i` | `--input FILE` | Input log file |
-| `-d` | `--directory DIR` | Input directory (recursive) |
-| `-o` | `--output DIR` | Output directory (required) |
+| `-d` | `--directory DIR` | Input directory (recursive) or a `.zip` bundle |
+| `-o` | `--output DIR` | Output directory (required, except with `--validate-only` / `--output-zip`) |
+|  | `--output-zip FILE` | Repack the anonymized result into a new `.zip` (zip input) |
 | `-f` | `--force` | Force overwrite / create directories |
 | `-v` | `--verbose` | Show filenames in progress bar |
 | `-m` | `--mapping` | Print mapping table to console |
@@ -212,8 +264,10 @@ veeam-log-anonymizer -d ./logs -o ./output -f -e pem
 |  | `--dict-output DIR` | Write dictionary to a separate directory (recommended) |
 | `-s` | `--stats` | Show detailed statistics |
 | `-e` | `--exclude TYPES` | Skip entity types (see below) |
-|  | `--dry-run` | Preview without writing files |
-|  | `--reverse FILE` | De-anonymize using dictionary JSON |
+|  | `--dry-run` | Preview without writing files (human-readable console listing) |
+|  | `--validate-only` | Scan only; emit JSON report (exit 0/2); writes nothing |
+|  | `--report-output FILE` | Write the `--validate-only` JSON report to a file |
+|  | `--reverse FILE` | De-anonymize using dictionary JSON (decrypts `.age` transparently) |
 |  | `--paranoid` | Re-scan output files to detect any leaked entities |
 |  | `--aggressive` | Enable detection of standalone FQDNs and naked usernames |
 |  | `--user-list FILE` | Explicit list of usernames |
@@ -221,6 +275,7 @@ veeam-log-anonymizer -d ./logs -o ./output -f -e pem
 |  | `--object-list FILE` | Explicit list of customer object names (VMs, datastores, hosts) |
 |  | `--db-list FILE` | Explicit list of database names |
 |  | `--keep-path-names` | Keep original file/directory names (path anonymization is on by default) |
+|  | `--encrypt-dict` | Encrypt the exported dictionary (`-D`) with a passphrase (age) |
 
 ### `--exclude` accepted types
 

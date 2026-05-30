@@ -16,6 +16,49 @@ fn run(args: &[&str]) -> std::process::Output {
         .expect("Failed to run binary")
 }
 
+/// Run the binary with extra environment variables set.
+fn run_env(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = std::process::Command::new(bin());
+    cmd.args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("Failed to run binary")
+}
+
+/// Create a `.zip` at `path` from (entry_name, contents) pairs.
+fn make_zip(path: &Path, entries: &[(&str, &str)]) {
+    use std::io::Write;
+    let file = fs::File::create(path).unwrap();
+    let mut zw = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, content) in entries {
+        zw.start_file(*name, opts).unwrap();
+        zw.write_all(content.as_bytes()).unwrap();
+    }
+    zw.finish().unwrap();
+}
+
+/// Read a `.zip` into a sorted list of (entry_name, contents) for files.
+fn read_zip(path: &Path) -> Vec<(String, String)> {
+    use std::io::Read;
+    let file = fs::File::open(path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let mut out = Vec::new();
+    for i in 0..archive.len() {
+        let mut e = archive.by_index(i).unwrap();
+        if e.is_file() {
+            let name = e.name().to_string();
+            let mut s = String::new();
+            let _ = e.read_to_string(&mut s);
+            out.push((name, s));
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Recursively collect every file path under `dir`.
 fn collect_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -1367,6 +1410,294 @@ fn paranoid_flags_leak_in_kept_path_name() {
     assert!(
         stderr.contains("path name") && stderr.contains("prod-host-01"),
         "paranoid must report the leaked hostname in the path name. stderr: {}",
+        stderr
+    );
+}
+
+// ── v2.6: --validate-only ───────────────────────────────────────────
+
+#[test]
+fn validate_only_json_report_and_exit_code() {
+    let input_dir = TempDir::new().unwrap();
+    fs::write(
+        input_dir.path().join("test.log"),
+        "admin@corp.com from 192.168.1.50\nCORP\\jdoe ran job\n",
+    )
+    .unwrap();
+
+    let out = run(&["-d", input_dir.path().to_str().unwrap(), "--validate-only"]);
+
+    // Entities present → deterministic exit code 2.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "exit code must be 2 when entities found"
+    );
+
+    // stdout must be PURE JSON (banner/chatter routed to stderr).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let trimmed = stdout.trim_start();
+    assert!(
+        trimmed.starts_with('{'),
+        "stdout must start with JSON. Got: {}",
+        stdout
+    );
+    assert!(stdout.contains("\"mode\": \"validate-only\""));
+    assert!(stdout.contains("\"entities_total\""));
+    assert!(stdout.contains("\"email\""));
+    assert!(stdout.contains("\"ip\""));
+
+    // Report must NOT leak original values.
+    assert!(
+        !stdout.contains("admin@corp.com") && !stdout.contains("192.168.1.50"),
+        "validate-only report must never contain original values. Got: {}",
+        stdout
+    );
+
+    // No files written (we passed no -o), and the source is unchanged.
+    let src = fs::read_to_string(input_dir.path().join("test.log")).unwrap();
+    assert!(
+        src.contains("admin@corp.com"),
+        "source file must be untouched"
+    );
+}
+
+#[test]
+fn validate_only_no_entities_exit_zero() {
+    let input_dir = TempDir::new().unwrap();
+    fs::write(
+        input_dir.path().join("clean.log"),
+        "just an ordinary log line with no secrets\n",
+    )
+    .unwrap();
+
+    let out = run(&["-d", input_dir.path().to_str().unwrap(), "--validate-only"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "exit code must be 0 when nothing detected"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"entities_total\": 0"));
+}
+
+#[test]
+fn validate_only_report_output_to_file() {
+    let input_dir = TempDir::new().unwrap();
+    let report = TempDir::new().unwrap();
+    let report_path = report.path().join("report.json");
+    fs::write(input_dir.path().join("t.log"), "x@y.com 10.0.0.9\n").unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "--validate-only",
+        "--report-output",
+        report_path.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(report_path.exists(), "report file must be written");
+    let report_json = fs::read_to_string(&report_path).unwrap();
+    assert!(report_json.contains("\"mode\": \"validate-only\""));
+}
+
+// ── v2.6: .zip input ────────────────────────────────────────────────
+
+#[test]
+fn zip_repack_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("bundle.zip");
+    let out_zip = dir.path().join("anon.zip");
+    make_zip(
+        &in_zip,
+        &[
+            ("Task.log", "admin@corp.com from 192.168.1.50\n"),
+            ("sub/agent.log", "connected 10.20.30.40\n"),
+            (
+                "sub/notes.txt",
+                "binary-ish or non-log content kept verbatim\n",
+            ),
+        ],
+    );
+
+    let out = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let entries = read_zip(&out_zip);
+    // Same number of file entries, same tree.
+    assert_eq!(entries.len(), 3, "entry count preserved: {:?}", entries);
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"Task.log"));
+    assert!(names.contains(&"sub/agent.log"));
+    assert!(names.contains(&"sub/notes.txt"));
+
+    // .log content anonymized; non-.log copied verbatim.
+    for (name, content) in &entries {
+        assert!(
+            !content.contains("admin@corp.com"),
+            "{} not anonymized",
+            name
+        );
+        assert!(!content.contains("192.168.1.50"), "{} not anonymized", name);
+        assert!(!content.contains("10.20.30.40"), "{} not anonymized", name);
+        if name.ends_with("notes.txt") {
+            assert!(content.contains("kept verbatim"), "non-log copied verbatim");
+        }
+    }
+
+    // The dictionary must never be inside the zip.
+    assert!(
+        !names.iter().any(|n| n.contains("veeam-anonymizer")),
+        "dictionary must not be packed in the zip"
+    );
+}
+
+#[test]
+fn zip_extract_mode() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("bundle.zip");
+    let out_dir = TempDir::new().unwrap();
+    make_zip(&in_zip, &[("a.log", "user admin@corp.com at 172.16.0.9\n")]);
+
+    let out = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "-o",
+        out_dir.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let content = fs::read_to_string(out_dir.path().join("a.log")).unwrap();
+    assert!(!content.contains("admin@corp.com") && !content.contains("172.16.0.9"));
+}
+
+#[test]
+fn zip_entry_name_anonymized_with_hostname_list() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("bundle.zip");
+    let out_zip = dir.path().join("anon.zip");
+    let list = dir.path().join("hosts.txt");
+    fs::write(&list, "vsa1\n").unwrap();
+    make_zip(&in_zip, &[("Task.vsa1.log", "host vsa1 ok\n")]);
+
+    let out = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "--hostname-list",
+        list.to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let entries = read_zip(&out_zip);
+    assert_eq!(entries.len(), 1);
+    assert!(
+        !entries[0].0.contains("vsa1"),
+        "entry name must be anonymized: {}",
+        entries[0].0
+    );
+    assert!(entries[0].0.starts_with("Task.") && entries[0].0.ends_with(".log"));
+}
+
+// ── v2.6: optional dictionary encryption ────────────────────────────
+
+#[test]
+fn encrypt_dict_round_trip_env_passphrase() {
+    let input_dir = TempDir::new().unwrap();
+    let anon = TempDir::new().unwrap();
+    let restored = TempDir::new().unwrap();
+    let dict_dir = TempDir::new().unwrap();
+    let original = "admin@corp.com from 192.168.1.50\n";
+    fs::write(input_dir.path().join("t.log"), original).unwrap();
+
+    // Forward with encrypted dictionary.
+    let out = run_env(
+        &[
+            "-d",
+            input_dir.path().to_str().unwrap(),
+            "-o",
+            anon.path().to_str().unwrap(),
+            "-f",
+            "-D",
+            "--dict-output",
+            dict_dir.path().to_str().unwrap(),
+            "--encrypt-dict",
+        ],
+        &[("VLAR_DICT_PASSPHRASE", "correct horse battery")],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // An encrypted .age dictionary was produced (no cleartext .json).
+    let age_dict = fs::read_dir(dict_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|x| x == "age").unwrap_or(false))
+        .expect(".json.age dictionary must exist");
+
+    // Reverse with the correct passphrase restores the original content.
+    let out = run_env(
+        &[
+            "-d",
+            anon.path().to_str().unwrap(),
+            "-o",
+            restored.path().to_str().unwrap(),
+            "-f",
+            "--reverse",
+            age_dict.to_str().unwrap(),
+        ],
+        &[("VLAR_DICT_PASSPHRASE", "correct horse battery")],
+    );
+    assert!(
+        out.status.success(),
+        "reverse stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(restored.path().join("t.log")).unwrap(),
+        original
+    );
+
+    // Wrong passphrase fails cleanly (non-zero exit, no panic).
+    let out = run_env(
+        &[
+            "-d",
+            anon.path().to_str().unwrap(),
+            "-o",
+            TempDir::new().unwrap().path().to_str().unwrap(),
+            "-f",
+            "--reverse",
+            age_dict.to_str().unwrap(),
+        ],
+        &[("VLAR_DICT_PASSPHRASE", "wrong passphrase")],
+    );
+    assert!(!out.status.success(), "wrong passphrase must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("passphrase") || stderr.to_lowercase().contains("decrypt"),
+        "must report a decryption error. stderr: {}",
         stderr
     );
 }

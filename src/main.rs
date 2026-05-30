@@ -1,4 +1,4 @@
-//! VeeamLogAnonymizer — Rust Edition v2.5
+//! VeeamLogAnonymizer — Rust Edition v2.6
 //!
 //! High-performance anonymization tool for Veeam Backup & Replication logs.
 //!
@@ -617,7 +617,9 @@ struct DictEntry {
     veeam-log-anonymizer -d /var/log/veeam -o ./anonymized -f -v -D
     veeam-log-anonymizer -d ./logs -o ./output -f --exclude ip
     veeam-log-anonymizer --reverse dict.json -d ./anonymized -o ./restored -f
-    veeam-log-anonymizer -d ./logs -o ./output --dry-run
+    veeam-log-anonymizer -d ./logs --validate-only --report-output audit.json
+    veeam-log-anonymizer -d bundle.zip --output-zip anon.zip -f -D --dict-output ./safe
+    veeam-log-anonymizer -d ./logs -o ./out -f -D --dict-output ./safe --encrypt-dict
 ")]
 struct Cli {
     /// Input log file
@@ -629,18 +631,32 @@ struct Cli {
     )]
     input_file: Option<PathBuf>,
 
-    /// Input directory containing log files (recursive)
+    /// Input directory containing log files (recursive). Also accepts a `.zip`
+    /// support bundle directly (auto-detected by extension / magic bytes).
     #[arg(
         short = 'd',
         long = "directory",
         group = "input_source",
-        value_name = "DIR"
+        value_name = "DIR_OR_ZIP"
     )]
     input_directory: Option<PathBuf>,
 
-    /// Output directory for anonymized files
-    #[arg(short = 'o', long = "output", required = true, value_name = "DIR")]
-    output_directory: PathBuf,
+    /// Output directory for anonymized files. Not required for --validate-only
+    /// or when --output-zip is used.
+    #[arg(
+        short = 'o',
+        long = "output",
+        required_unless_present_any = ["validate_only", "output_zip"],
+        value_name = "DIR"
+    )]
+    output_directory: Option<PathBuf>,
+
+    /// Repack the anonymized result into a new `.zip` at this path (instead of
+    /// writing a directory). Recommended when the input is a `.zip` bundle —
+    /// this is what you send back to support. The dictionary is NEVER written
+    /// inside the zip.
+    #[arg(long = "output-zip", value_name = "FILE")]
+    output_zip: Option<PathBuf>,
 
     /// Force overwrite existing files and create directories
     #[arg(short = 'f', long = "force")]
@@ -678,9 +694,21 @@ struct Cli {
     )]
     exclude: Vec<String>,
 
-    /// Preview what would be anonymized without writing files
+    /// Preview what would be anonymized without writing files (human-readable
+    /// console listing of every mapping).
     #[arg(long = "dry-run")]
     dry_run: bool,
+
+    /// Validate-only mode: scan without writing anything and emit a machine-
+    /// readable JSON report (entity counts by kind and by file — never the
+    /// original values). Exit code: 0 if no entities detected, 2 if entities
+    /// were detected, 1 on error. Useful for pipelines / agent orchestration.
+    #[arg(long = "validate-only")]
+    validate_only: bool,
+
+    /// Write the --validate-only JSON report to this file instead of stdout.
+    #[arg(long = "report-output", value_name = "FILE")]
+    report_output: Option<PathBuf>,
 
     /// Reverse anonymization using a dictionary JSON file
     #[arg(long = "reverse", value_name = "DICT_FILE")]
@@ -725,6 +753,33 @@ struct Cli {
     /// (their masked forms contain characters invalid in filenames).
     #[arg(long = "keep-path-names")]
     keep_path_names: bool,
+
+    /// Encrypt the exported dictionary (used with -D) with a passphrase using
+    /// the `age` format. Output file gets a `.age` suffix. The passphrase is
+    /// read from the VLAR_DICT_PASSPHRASE env var if set, otherwise prompted
+    /// interactively (never passed as a CLI argument). --reverse transparently
+    /// decrypts a `.age` dictionary. Optional / opt-in.
+    #[arg(long = "encrypt-dict")]
+    encrypt_dict: bool,
+}
+
+impl Cli {
+    /// Resolve the output directory, erroring if it was not provided. clap only
+    /// requires `-o` outside --validate-only / --output-zip, so callers that
+    /// always need a directory use this.
+    fn require_output_dir(&self) -> Result<&Path> {
+        self.output_directory
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("an output directory (-o/--output) is required here"))
+    }
+
+    /// True when the input is a `.zip` bundle (by extension or PK magic bytes).
+    fn input_is_zip(&self) -> bool {
+        match (&self.input_directory, &self.input_file) {
+            (Some(p), _) | (_, Some(p)) => path_is_zip(p),
+            _ => false,
+        }
+    }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1425,6 +1480,27 @@ fn extract_entities(content: &str, cfg: &ExtractConfig) -> ExtractedEntities {
     out
 }
 
+/// Extract entities from a file's content AND its (relative) path name.
+/// An email / FQDN / IP / backup-file present ONLY in a file or directory name
+/// must still be detected so it can be anonymized in the output path. Short bare
+/// hostnames remain non-auto-detectable by design (use --hostname-list /
+/// --object-list). Shared by the filesystem scan and the `.zip` scan.
+fn extract_entities_with_path(content: &str, rel: &str, cfg: &ExtractConfig) -> ExtractedEntities {
+    let mut entities = extract_entities(content, cfg);
+    if !rel.is_empty() {
+        entities.merge(extract_entities(rel, cfg));
+        // Also scan with the trailing file extension stripped: a FQDN at the end
+        // of a name (host.example.com.log) would otherwise be swallowed by the
+        // ".log" extension and rejected (TLD "log").
+        if let Some((stem, _ext)) = rel.rsplit_once('.') {
+            if stem != rel && stem.contains('.') {
+                entities.merge(extract_entities(stem, cfg));
+            }
+        }
+    }
+    entities
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // File reading with encoding detection (UTF-8 / UTF-16 BOM)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1434,31 +1510,37 @@ fn extract_entities(content: &str, cfg: &ExtractConfig) -> ExtractedEntities {
 /// fallback for everything else.
 fn read_file_smart(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("Failed to read: {}", path.display()))?;
+    Ok(decode_bytes(&bytes))
+}
 
+/// Decode a byte buffer to String with encoding detection. Handles UTF-8
+/// (with/without BOM), UTF-16 LE/BE (with BOM), and lossy fallback. Shared by
+/// `read_file_smart` (filesystem) and the `.zip` reader (in-memory entries).
+fn decode_bytes(bytes: &[u8]) -> String {
     if bytes.is_empty() {
-        return Ok(String::new());
+        return String::new();
     }
 
     // BOM-based detection
     if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
         // UTF-8 BOM
-        return Ok(String::from_utf8_lossy(&bytes[3..]).into_owned());
+        return String::from_utf8_lossy(&bytes[3..]).into_owned();
     }
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
         // UTF-16 LE BOM
         let (cow, _, _) = encoding_rs::UTF_16LE.decode(&bytes[2..]);
-        return Ok(cow.into_owned());
+        return cow.into_owned();
     }
     if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
         // UTF-16 BE BOM
         let (cow, _, _) = encoding_rs::UTF_16BE.decode(&bytes[2..]);
-        return Ok(cow.into_owned());
+        return cow.into_owned();
     }
 
     // No BOM — try UTF-8 strict, fall back to lossy
-    match std::str::from_utf8(&bytes) {
-        Ok(s) => Ok(s.to_string()),
-        Err(_) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
 
@@ -1507,28 +1589,9 @@ fn collect_entities(
                     scan_bar.set_message(name.to_string());
                 }
             }
-            let mut entities = match read_file_smart(file) {
-                Ok(content) => extract_entities(&content, extract_cfg),
-                Err(_) => ExtractedEntities::default(),
-            };
-            // Also scan the (relative) path name itself: an email / FQDN / IP /
-            // backup-file present ONLY in a file or directory name must still be
-            // detected so it can be anonymized in the output path. Short bare
-            // hostnames remain non-auto-detectable by design — provide them via
-            // --hostname-list / --object-list.
+            let content = read_file_smart(file).unwrap_or_default();
             let rel = relative_path_str(file, base_dir);
-            if !rel.is_empty() {
-                entities.merge(extract_entities(&rel, extract_cfg));
-                // Also scan with the trailing file extension stripped: a FQDN
-                // at the end of a name (host.example.com.log) would otherwise be
-                // swallowed by the ".log" extension and rejected (TLD "log").
-                if let Some((stem, _ext)) = rel.rsplit_once('.') {
-                    if stem != rel && stem.contains('.') {
-                        entities.merge(extract_entities(stem, extract_cfg));
-                    }
-                }
-            }
-            entities
+            extract_entities_with_path(&content, &rel, extract_cfg)
         })
         .reduce(ExtractedEntities::default, |mut acc, item| {
             acc.merge(item);
@@ -1537,6 +1600,18 @@ fn collect_entities(
 
     scan_bar.finish_with_message("done");
 
+    Ok(build_map(raw, exclude, extract_cfg))
+}
+
+/// Build the anonymization map from raw extracted entities: apply the exclusion
+/// filter, then generate consistent, collision-checked replacements (domains
+/// first as the single source of truth, then everything keyed off them).
+/// Pure (no IO) so both the filesystem scan and the `.zip` scan reuse it.
+fn build_map(
+    raw: ExtractedEntities,
+    exclude: &ExcludeFilter,
+    extract_cfg: &ExtractConfig,
+) -> AnonymizationMap {
     // Apply exclusion filter
     let emails = if exclude.process_emails() {
         raw.emails
@@ -1832,7 +1907,7 @@ fn collect_entities(
         map.dbs.insert(d.clone(), format!("db-{}", body));
     }
 
-    Ok(map)
+    map
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2034,6 +2109,7 @@ fn process_files(
     cli: &Cli,
 ) -> Result<()> {
     let anon_bar = make_anon_bar(input_files.len() as u64);
+    let output_dir = cli.require_output_dir()?;
 
     // Path-safe replacement pairs for anonymizing file/directory names.
     let path_pairs = collect_path_replacement_pairs(map);
@@ -2044,7 +2120,7 @@ fn process_files(
         .try_for_each(|input_file| -> Result<()> {
             // Compute output path (preserving subdirectory structure, with
             // sensitive entities in path names anonymized unless --keep-path-names)
-            let output_file = compute_output_path(input_file, cli, &path_pairs);
+            let output_file = compute_output_path(input_file, output_dir, cli, &path_pairs);
 
             // Create parent directories if needed
             if let Some(parent) = output_file.parent() {
@@ -2123,7 +2199,12 @@ fn anonymize_relative_path(relative: &Path, path_pairs: &[(String, String)]) -> 
 
 /// Compute the output file path, preserving directory structure and (unless
 /// `--keep-path-names`) anonymizing sensitive entities in path components.
-fn compute_output_path(input_file: &Path, cli: &Cli, path_pairs: &[(String, String)]) -> PathBuf {
+fn compute_output_path(
+    input_file: &Path,
+    output_dir: &Path,
+    cli: &Cli,
+    path_pairs: &[(String, String)],
+) -> PathBuf {
     // Relative path under the output directory (file name in single-file mode).
     let relative: PathBuf = if let Some(ref input_dir) = cli.input_directory {
         input_file
@@ -2141,7 +2222,7 @@ fn compute_output_path(input_file: &Path, cli: &Cli, path_pairs: &[(String, Stri
         anonymize_relative_path(&relative, path_pairs)
     };
 
-    cli.output_directory.join(relative)
+    output_dir.join(relative)
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2282,10 +2363,10 @@ fn export_dictionary(
     map: &AnonymizationMap,
     output_dir: &Path,
     file_count: usize,
+    encrypt: bool,
 ) -> Result<PathBuf> {
     let now = Local::now();
-    let filename = format!("veeam-anonymizer-{}.json", now.format("%Y%m%d_%H%M%S"));
-    let path = output_dir.join(&filename);
+    let base = format!("veeam-anonymizer-{}.json", now.format("%Y%m%d_%H%M%S"));
 
     let dict = OutputDictionary {
         metadata: DictMetadata {
@@ -2312,8 +2393,102 @@ fn export_dictionary(
     };
 
     let json = serde_json::to_string_pretty(&dict)?;
-    fs::write(&path, json)?;
-    Ok(path)
+
+    if encrypt {
+        // Opt-in: encrypt the dictionary with a passphrase (age format).
+        let passphrase = read_passphrase(true)?;
+        let encrypted = encrypt_with_passphrase(json.as_bytes(), &passphrase)?;
+        let path = output_dir.join(format!("{}.age", base));
+        fs::write(&path, encrypted)?;
+        println!("  🔒 Dictionary encrypted (age). Keep the passphrase safe — losing it means");
+        println!("     the anonymization can never be reversed.");
+        Ok(path)
+    } else {
+        let path = output_dir.join(&base);
+        fs::write(&path, json)?;
+        Ok(path)
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Optional dictionary encryption (age + passphrase). Opt-in via --encrypt-dict.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Read the dictionary passphrase from the VLAR_DICT_PASSPHRASE env var (for
+/// automation) or, failing that, an interactive hidden prompt. Never accepted
+/// as a CLI argument (would leak via shell history / `ps`). When `confirm` is
+/// set (encryption), the interactive prompt asks twice and checks they match.
+fn read_passphrase(confirm: bool) -> Result<String> {
+    if let Ok(p) = std::env::var("VLAR_DICT_PASSPHRASE") {
+        if p.is_empty() {
+            anyhow::bail!("VLAR_DICT_PASSPHRASE is set but empty");
+        }
+        return Ok(p);
+    }
+    let pass = rpassword::prompt_password("  Dictionary passphrase: ")
+        .context("Failed to read passphrase")?;
+    if pass.is_empty() {
+        anyhow::bail!("Passphrase must not be empty");
+    }
+    if confirm {
+        let again = rpassword::prompt_password("  Confirm passphrase: ")
+            .context("Failed to read passphrase confirmation")?;
+        if pass != again {
+            anyhow::bail!("Passphrases do not match");
+        }
+    }
+    Ok(pass)
+}
+
+/// Encrypt bytes with a scrypt passphrase using the age format.
+fn encrypt_with_passphrase(plaintext: &[u8], passphrase: &str) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let secret = age::secrecy::SecretString::from(passphrase.to_owned());
+    let encryptor = age::Encryptor::with_user_passphrase(secret);
+    let mut encrypted = Vec::new();
+    let mut writer = encryptor
+        .wrap_output(&mut encrypted)
+        .context("Failed to initialize age encryptor")?;
+    writer
+        .write_all(plaintext)
+        .context("Failed to write encrypted dictionary")?;
+    writer.finish().context("Failed to finalize encryption")?;
+    Ok(encrypted)
+}
+
+/// Decrypt age passphrase-encrypted bytes. Returns a clear error (no panic) on
+/// a wrong passphrase or malformed input.
+fn decrypt_with_passphrase(ciphertext: &[u8], passphrase: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let secret = age::secrecy::SecretString::from(passphrase.to_owned());
+    let decryptor = age::Decryptor::new(ciphertext)
+        .context("Not a valid age file (is this an encrypted dictionary?)")?;
+    let identity = age::scrypt::Identity::new(secret);
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .map_err(|_| anyhow::anyhow!("Decryption failed — wrong passphrase?"))?;
+    let mut decrypted = Vec::new();
+    reader
+        .read_to_end(&mut decrypted)
+        .context("Failed to read decrypted dictionary")?;
+    Ok(decrypted)
+}
+
+/// Load a dictionary JSON, transparently decrypting if it is age-encrypted
+/// (`.age` extension or age magic header).
+fn load_dictionary(dict_path: &Path) -> Result<OutputDictionary> {
+    let bytes = fs::read(dict_path)
+        .with_context(|| format!("Failed to read dictionary: {}", dict_path.display()))?;
+    let is_age = dict_path.extension().map(|e| e == "age").unwrap_or(false)
+        || bytes.starts_with(b"age-encryption.org/");
+    let json = if is_age {
+        let passphrase = read_passphrase(false)?;
+        let decrypted = decrypt_with_passphrase(&bytes, &passphrase)?;
+        decode_bytes(&decrypted)
+    } else {
+        decode_bytes(&bytes)
+    };
+    serde_json::from_str(&json).context("Failed to parse dictionary JSON")
 }
 
 /// Convert a HashMap<String,String> into a Vec<DictEntry> for serialization.
@@ -2327,10 +2502,8 @@ fn to_entries(m: &HashMap<String, String>) -> Vec<DictEntry> {
 }
 
 fn reverse_anonymize(dict_path: &Path, input_files: &[PathBuf], cli: &Cli) -> Result<()> {
-    let dict_content = fs::read_to_string(dict_path)
-        .with_context(|| format!("Failed to read dictionary: {}", dict_path.display()))?;
-    let dict: OutputDictionary =
-        serde_json::from_str(&dict_content).with_context(|| "Failed to parse dictionary JSON")?;
+    // Transparently decrypts an age-encrypted (.age) dictionary if needed.
+    let dict: OutputDictionary = load_dictionary(dict_path)?;
 
     // Integrity check: metadata count vs actual mappings
     let actual_count = dict.mappings.emails.len()
@@ -2424,12 +2597,13 @@ fn reverse_anonymize(dict_path: &Path, input_files: &[PathBuf], cli: &Cli) -> Re
 
     let anon_bar = make_anon_bar(input_files.len() as u64);
     anon_bar.set_prefix("[1/1] Reversing ");
+    let output_dir = cli.require_output_dir()?;
 
     input_files
         .par_iter()
         .progress_with(anon_bar.clone())
         .try_for_each(|input_file| -> Result<()> {
-            let output_file = compute_output_path(input_file, cli, &reverse_path_pairs);
+            let output_file = compute_output_path(input_file, output_dir, cli, &reverse_path_pairs);
 
             if let Some(parent) = output_file.parent() {
                 if !parent.exists() && cli.force {
@@ -2516,6 +2690,7 @@ fn paranoid_rescan(input_files: &[PathBuf], map: &AnonymizationMap, cli: &Cli) -
 
     // Path-safe pairs are used to locate the (possibly renamed) output file.
     let path_pairs = collect_path_replacement_pairs(map);
+    let output_dir = cli.require_output_dir()?;
 
     // Word-boundary leak scan helper, shared by content and path-name checks.
     let scan_leaks = |text: &str, sink: &mut HashSet<usize>| {
@@ -2538,14 +2713,14 @@ fn paranoid_rescan(input_files: &[PathBuf], map: &AnonymizationMap, cli: &Cli) -
     let total_leaks: usize = input_files
         .par_iter()
         .map(|input_file| -> usize {
-            let output_file = compute_output_path(input_file, cli, &path_pairs);
+            let output_file = compute_output_path(input_file, output_dir, cli, &path_pairs);
 
             // Check the output path NAME itself (file + directory components).
             // Catches sensitive tokens — e.g. short hostnames not provided via
             // --hostname-list — still present in a renamed path.
             let mut name_leaks: HashSet<usize> = HashSet::new();
             let rel_name = output_file
-                .strip_prefix(&cli.output_directory)
+                .strip_prefix(output_dir)
                 .unwrap_or(&output_file)
                 .to_string_lossy();
             scan_leaks(&rel_name, &mut name_leaks);
@@ -2591,7 +2766,7 @@ fn load_list_file(path: &Option<PathBuf>, label: &str) -> Result<HashSet<String>
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .collect();
             if !set.is_empty() {
-                println!("  {}: {} entries loaded", label, set.len());
+                eprintln!("  {}: {} entries loaded", label, set.len());
             }
             Ok(set)
         }
@@ -2602,19 +2777,54 @@ fn load_list_file(path: &Option<PathBuf>, label: &str) -> Result<HashSet<String>
 // Main entry point
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-fn main() -> Result<()> {
+/// Exit codes (deterministic, for pipeline / agent orchestration).
+const EXIT_OK: i32 = 0;
+const EXIT_ENTITIES_DETECTED: i32 = 2; // --validate-only found entities
+
+fn main() {
+    match run() {
+        Ok(code) => {
+            // Flush before exiting (process::exit does not run destructors).
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code);
+        }
+        Err(e) => {
+            eprintln!("Error: {:#}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run() -> Result<i32> {
     let cli = Cli::parse();
     let start = Instant::now();
 
+    // In --validate-only the JSON report owns stdout, so all human chatter goes
+    // to stderr (keeps `vlar … --validate-only | jq` clean).
+    let quiet = cli.validate_only;
+
     // Banner
-    println!("{}", BANNER);
-    println!("  v{} — Rust Edition", VERSION);
-    println!("  Author: Bertrand Castagnet (EMEA TAM at Veeam France)");
-    println!("  Coverage aligned with Veeam KB2462 — https://www.veeam.com/kb2462");
-    println!();
-    println!("  ⚠ COMMUNITY PROJECT — no official Veeam support. Use at your own risk.");
-    println!("  ⚠ Always verify anonymized output before sharing with third parties.");
-    println!();
+    banner_line(quiet, BANNER);
+    banner_line(quiet, &format!("  v{} — Rust Edition", VERSION));
+    banner_line(
+        quiet,
+        "  Author: Bertrand Castagnet (EMEA TAM at Veeam France)",
+    );
+    banner_line(
+        quiet,
+        "  Coverage aligned with Veeam KB2462 — https://www.veeam.com/kb2462",
+    );
+    banner_line(quiet, "");
+    banner_line(
+        quiet,
+        "  ⚠ COMMUNITY PROJECT — no official Veeam support. Use at your own risk.",
+    );
+    banner_line(
+        quiet,
+        "  ⚠ Always verify anonymized output before sharing with third parties.",
+    );
+    banner_line(quiet, "");
 
     // Parse exclusion filter (fail fast on invalid types)
     let exclude = ExcludeFilter::from_strings(&cli.exclude).unwrap_or_else(|e| {
@@ -2623,14 +2833,20 @@ fn main() -> Result<()> {
     });
 
     if !exclude.is_empty() {
-        println!("  Excluding: {}\n", exclude.excluded_names().join(", "));
+        banner_line(
+            quiet,
+            &format!("  Excluding: {}\n", exclude.excluded_names().join(", ")),
+        );
     }
 
     if cli.aggressive {
-        println!("  Aggressive detection: standalone FQDNs + naked usernames\n");
+        banner_line(
+            quiet,
+            "  Aggressive detection: standalone FQDNs + naked usernames\n",
+        );
     }
 
-    // Load --user-list if provided
+    // Load explicit lists if provided
     let user_list = load_list_file(&cli.user_list, "user list")?;
     let hostname_list = load_list_file(&cli.hostname_list, "hostname list")?;
     let object_list = load_list_file(&cli.object_list, "object list")?;
@@ -2644,24 +2860,44 @@ fn main() -> Result<()> {
         db_list,
     };
 
-    // Collect input files
+    // ── VALIDATE-ONLY MODE ── (scan only, JSON report, deterministic exit code).
+    // Checked early so stdout carries only the JSON report.
+    if cli.validate_only {
+        if cli.reverse.is_some() {
+            anyhow::bail!("--validate-only cannot be combined with --reverse");
+        }
+        return run_validate_only(&cli, &exclude, &extract_cfg);
+    }
+
+    // ── ZIP INPUT ── (anonymize a .zip bundle directly)
+    if cli.input_is_zip() {
+        if cli.reverse.is_some() {
+            anyhow::bail!("--reverse is not supported with a .zip input; extract it first.");
+        }
+        return run_zip(&cli, &exclude, &extract_cfg);
+    }
+
+    // Collect input files (directory / single file mode)
     let files = collect_input_files(&cli)?;
     println!("  Found {} log file(s)\n", files.len());
 
     // ── REVERSE MODE ──
     if let Some(ref dict_path) = cli.reverse {
-        return reverse_anonymize(dict_path, &files, &cli);
+        reverse_anonymize(dict_path, &files, &cli)?;
+        return Ok(EXIT_OK);
     }
 
+    let output_dir = cli.require_output_dir()?;
+
     // Ensure output directory exists
-    if !cli.output_directory.exists() {
+    if !output_dir.exists() {
         if cli.force {
-            fs::create_dir_all(&cli.output_directory)
-                .with_context(|| format!("Failed to create: {}", cli.output_directory.display()))?;
+            fs::create_dir_all(output_dir)
+                .with_context(|| format!("Failed to create: {}", output_dir.display()))?;
         } else {
             anyhow::bail!(
                 "Output directory does not exist: {}. Use -f to create it.",
-                cli.output_directory.display()
+                output_dir.display()
             );
         }
     }
@@ -2675,6 +2911,62 @@ fn main() -> Result<()> {
         cli.verbose,
     )?;
 
+    print_found_summary(&map);
+
+    // ── DRY-RUN MODE ──
+    if cli.dry_run {
+        print_dry_run_report(&map);
+        return Ok(EXIT_OK);
+    }
+
+    // Show mapping if requested
+    if cli.mapping {
+        print_mapping(&map);
+    }
+
+    // Export dictionary if requested
+    if cli.dictionary {
+        export_dictionary_for_cli(&map, &cli, files.len())?;
+    }
+
+    // Phase 2: Anonymize files
+    process_files(&files, &map, &exclude, &cli)?;
+
+    // Paranoid mode: re-scan output to detect leaked entities
+    if cli.paranoid {
+        report_paranoid(paranoid_rescan(&files, &map, &cli)?);
+    }
+
+    // Show statistics if requested
+    let elapsed = start.elapsed();
+    if cli.stats {
+        print_statistics(&map, files.len(), elapsed);
+    }
+
+    // Summary
+    println!(
+        "\n  Anonymization complete: {} files, {} entities in {:.2}s",
+        files.len(),
+        map.total_entities(),
+        elapsed.as_secs_f64()
+    );
+    println!("  Output: {}", output_dir.display());
+
+    Ok(EXIT_OK)
+}
+
+/// Print a banner/info line to stdout, or to stderr when `quiet` (so that
+/// --validate-only keeps stdout reserved for the JSON report).
+fn banner_line(quiet: bool, line: &str) {
+    if quiet {
+        eprintln!("{}", line);
+    } else {
+        println!("{}", line);
+    }
+}
+
+/// Print the "Found: N emails, …" two-line entity summary to stdout.
+fn print_found_summary(map: &AnonymizationMap) {
     println!(
         "\n  Found: {} emails, {} users, {} domains, {} IPv4, {} IPv6, {} MACs",
         map.emails.len(),
@@ -2694,84 +2986,523 @@ fn main() -> Result<()> {
         map.backup_files.len(),
         map.ssh_fps.len(),
     );
+}
 
-    // ── DRY-RUN MODE ──
-    if cli.dry_run {
-        print_dry_run_report(&map);
-        return Ok(());
+/// Print the paranoid-rescan outcome.
+fn report_paranoid(leaks: usize) {
+    if leaks > 0 {
+        eprintln!(
+            "\n  ⚠ PARANOID CHECK: {} potentially sensitive entities found in output",
+            leaks
+        );
+        eprintln!("  ⚠ Review output before sharing. This may indicate false negatives in detection regexes.");
+    } else {
+        println!("\n  ✓ Paranoid check: no leaked entities detected in output.");
+    }
+}
+
+/// Resolve the dictionary directory, export, and print the appropriate warning.
+/// Shared by the file pipeline and the zip pipeline.
+fn export_dictionary_for_cli(map: &AnonymizationMap, cli: &Cli, file_count: usize) -> Result<()> {
+    // For zip output, the dictionary must land OUTSIDE the zip — default to the
+    // current directory if neither --dict-output nor -o is available.
+    let (dict_dir, in_output) = match (&cli.dict_output, &cli.output_directory) {
+        (Some(p), _) => (p.clone(), false),
+        (None, Some(o)) => (o.clone(), true),
+        (None, None) => (PathBuf::from("."), false),
+    };
+    if !dict_dir.exists() {
+        if cli.force {
+            fs::create_dir_all(&dict_dir).with_context(|| {
+                format!("Failed to create dict directory: {}", dict_dir.display())
+            })?;
+        } else {
+            anyhow::bail!(
+                "Dictionary directory does not exist: {}. Use -f to create it.",
+                dict_dir.display()
+            );
+        }
+    }
+    let dict_path = export_dictionary(map, &dict_dir, file_count, cli.encrypt_dict)?;
+    println!("  Dictionary: {}", dict_path.display());
+    if in_output {
+        eprintln!(
+            "  ⚠ WARNING: dictionary is inside the OUTPUT directory ({}).",
+            dict_dir.display()
+        );
+        eprintln!(
+            "  ⚠ Do NOT include it in your support bundle — it can reverse the anonymization."
+        );
+        eprintln!("  ⚠ Use --dict-output <DIR> next time to keep it separate.\n");
+    } else {
+        println!();
+    }
+    Ok(())
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// --validate-only : scan, no writes, JSON report, deterministic exit code
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[derive(Serialize)]
+struct ValidateReport {
+    tool_version: String,
+    mode: String,
+    scanned_at: String,
+    source: String,
+    product: String,
+    summary: ValidateSummary,
+    by_file: Vec<FileEntities>,
+}
+
+#[derive(Serialize)]
+struct ValidateSummary {
+    files_scanned: usize,
+    entities_total: usize,
+    by_kind: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Serialize)]
+struct FileEntities {
+    file: String,
+    entity_count: usize,
+    entities: Vec<KindCount>,
+}
+
+#[derive(Serialize)]
+struct KindCount {
+    kind: String,
+    occurrences: usize,
+}
+
+/// Distinct count of each auto-detected kind in one file's extracted entities,
+/// honoring the exclusion filter. Stable order. List-injected kinds
+/// (hostname/object/db) are global, not per-file, so they're omitted here and
+/// only appear in the summary.
+fn kind_counts(e: &ExtractedEntities, exclude: &ExcludeFilter) -> Vec<(EntityKind, usize)> {
+    let mac = e.macs_colon.len() + e.macs_compact.len();
+    let candidates = [
+        (EntityKind::Email, e.emails.len(), exclude.process_emails()),
+        (
+            EntityKind::DomainUser,
+            e.domain_users.len(),
+            exclude.process_domain_users(),
+        ),
+        (
+            EntityKind::Domain,
+            e.domains.len(),
+            exclude.process_domains(),
+        ),
+        (EntityKind::Ip, e.ips.len(), exclude.process_ips()),
+        (
+            EntityKind::NakedUser,
+            e.naked_users.len(),
+            exclude.process_naked_users(),
+        ),
+        (EntityKind::Fqdn, e.fqdns.len(), exclude.process_fqdns()),
+        (EntityKind::Ipv6, e.ipv6s.len(), exclude.process_ipv6()),
+        (EntityKind::Mac, mac, exclude.process_mac()),
+        (EntityKind::SshFp, e.ssh_fps.len(), exclude.process_ssh_fp()),
+        (
+            EntityKind::BackupFile,
+            e.backup_files.len(),
+            exclude.process_backup_files(),
+        ),
+    ];
+    candidates
+        .into_iter()
+        .filter(|&(_, n, on)| on && n > 0)
+        .map(|(k, n, _)| (k, n))
+        .collect()
+}
+
+/// One scanned unit (a file on disk or a zip entry) and its extracted entities.
+struct ScannedUnit {
+    rel: String,
+    entities: ExtractedEntities,
+}
+
+/// Build the validate-only JSON report from scanned units + the explicit lists.
+fn build_validate_report(
+    units: Vec<ScannedUnit>,
+    exclude: &ExcludeFilter,
+    cfg: &ExtractConfig,
+    source: &str,
+) -> ValidateReport {
+    let files_scanned = units.len();
+
+    // Per-file section.
+    let mut by_file: Vec<FileEntities> = Vec::with_capacity(units.len());
+    let mut union = ExtractedEntities::default();
+    for unit in units {
+        let counts = kind_counts(&unit.entities, exclude);
+        let entity_count: usize = counts.iter().map(|(_, n)| n).sum();
+        if entity_count > 0 {
+            by_file.push(FileEntities {
+                file: unit.rel,
+                entity_count,
+                entities: counts
+                    .into_iter()
+                    .map(|(k, n)| KindCount {
+                        kind: k.to_string(),
+                        occurrences: n,
+                    })
+                    .collect(),
+            });
+        }
+        union.merge(unit.entities);
+    }
+    by_file.sort_by(|a, b| {
+        b.entity_count
+            .cmp(&a.entity_count)
+            .then(a.file.cmp(&b.file))
+    });
+
+    // Global summary: unique auto-detected counts + explicit-list sizes.
+    let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (k, n) in kind_counts(&union, exclude) {
+        by_kind.insert(k.to_string(), n);
+    }
+    if exclude.process_hostnames() && !cfg.hostname_list.is_empty() {
+        by_kind.insert(EntityKind::Hostname.to_string(), cfg.hostname_list.len());
+    }
+    if exclude.process_objects() && !cfg.object_list.is_empty() {
+        by_kind.insert(EntityKind::Object.to_string(), cfg.object_list.len());
+    }
+    if exclude.process_dbs() && !cfg.db_list.is_empty() {
+        by_kind.insert(EntityKind::Db.to_string(), cfg.db_list.len());
+    }
+    let entities_total: usize = by_kind.values().sum();
+
+    ValidateReport {
+        tool_version: VERSION.to_string(),
+        mode: "validate-only".to_string(),
+        scanned_at: Local::now().to_rfc3339(),
+        source: source.to_string(),
+        product: "VBR".to_string(),
+        summary: ValidateSummary {
+            files_scanned,
+            entities_total,
+            by_kind,
+        },
+        by_file,
+    }
+}
+
+/// `--validate-only` entry point. Scans (directory/file or zip), emits the JSON
+/// report to stdout or `--report-output`, writes nothing, and returns the
+/// deterministic exit code (2 if any entity detected, else 0).
+fn run_validate_only(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i32> {
+    let (units, source) = if cli.input_is_zip() {
+        let zip_path = zip_input_path(cli);
+        (
+            scan_zip_units(zip_path, cfg)?,
+            zip_path.display().to_string(),
+        )
+    } else {
+        let files = collect_input_files(cli)?;
+        let base = cli.input_directory.as_deref();
+        let units: Vec<ScannedUnit> = files
+            .par_iter()
+            .map(|file| {
+                let content = read_file_smart(file).unwrap_or_default();
+                let rel = relative_path_str(file, base);
+                ScannedUnit {
+                    entities: extract_entities_with_path(&content, &rel, cfg),
+                    rel,
+                }
+            })
+            .collect();
+        let source = cli
+            .input_directory
+            .as_ref()
+            .or(cli.input_file.as_ref())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        (units, source)
+    };
+
+    let report = build_validate_report(units, exclude, cfg, &source);
+    let json = serde_json::to_string_pretty(&report)?;
+
+    if let Some(path) = &cli.report_output {
+        fs::write(path, &json)
+            .with_context(|| format!("Failed to write report: {}", path.display()))?;
+        println!("  Validation report written to {}", path.display());
+    } else {
+        println!("{}", json);
     }
 
-    // Show mapping if requested
+    Ok(if report.summary.entities_total > 0 {
+        EXIT_ENTITIES_DETECTED
+    } else {
+        EXIT_OK
+    })
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// .zip bundle input (scan + repack / extract)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Path of the `.zip` input (from -d or -i).
+fn zip_input_path(cli: &Cli) -> &Path {
+    cli.input_directory
+        .as_deref()
+        .or(cli.input_file.as_deref())
+        .expect("zip input path present")
+}
+
+/// True if `p` looks like a zip (extension `.zip` or PK magic bytes).
+fn path_is_zip(p: &Path) -> bool {
+    if p.extension()
+        .map(|e| e.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    use std::io::Read;
+    if let Ok(mut f) = fs::File::open(p) {
+        let mut magic = [0u8; 4];
+        if f.read_exact(&mut magic).is_ok() {
+            return &magic == b"PK\x03\x04" || &magic == b"PK\x05\x06";
+        }
+    }
+    false
+}
+
+/// Whether a zip entry name denotes a `.log` file (content gets anonymized).
+fn entry_is_log(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("log"))
+        .unwrap_or(false)
+}
+
+/// Anonymize a zip entry path (forward-slash separated) component-by-component.
+fn anonymize_entry_name(name: &str, pairs: &[(String, String)], keep: bool) -> String {
+    if keep || pairs.is_empty() {
+        return name.to_string();
+    }
+    name.split('/')
+        .map(|seg| {
+            if seg.is_empty() {
+                seg.to_string()
+            } else {
+                apply_pairs(seg, pairs)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Scan all entries of a zip into ScannedUnits (content for `.log`, path name
+/// for every entry). One entry in memory at a time (memory bounded).
+fn scan_zip_units(zip_path: &Path, cfg: &ExtractConfig) -> Result<Vec<ScannedUnit>> {
+    use std::io::Read;
+    let file = fs::File::open(zip_path)
+        .with_context(|| format!("Failed to open zip: {}", zip_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("Failed to read zip archive: {}", zip_path.display()))?;
+
+    let mut units = Vec::new();
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        let content = if entry_is_log(&name) {
+            let mut bytes = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut bytes)?;
+            decode_bytes(&bytes)
+        } else {
+            String::new()
+        };
+        units.push(ScannedUnit {
+            entities: extract_entities_with_path(&content, &name, cfg),
+            rel: name,
+        });
+    }
+    Ok(units)
+}
+
+/// Scan a zip into a raw entity set for map building (+ count of file entries).
+fn scan_zip_entities(zip_path: &Path, cfg: &ExtractConfig) -> Result<(ExtractedEntities, usize)> {
+    let units = scan_zip_units(zip_path, cfg)?;
+    let count = units.len();
+    let mut raw = ExtractedEntities::default();
+    for u in units {
+        raw.merge(u.entities);
+    }
+    Ok((raw, count))
+}
+
+/// Anonymize a `.zip` bundle: repack into `--output-zip` if set, else extract
+/// into `-o DIR`. Anonymizes `.log` content and every entry name; copies other
+/// entries byte-for-byte. The dictionary is never written inside the zip.
+fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i32> {
+    let zip_path = zip_input_path(cli).to_path_buf();
+
+    // Phase 1: scan
+    let (raw, file_count) = scan_zip_entities(&zip_path, cfg)?;
+    let map = build_map(raw, exclude, cfg);
+    print_found_summary(&map);
+
+    if cli.dry_run {
+        print_dry_run_report(&map);
+        return Ok(EXIT_OK);
+    }
     if cli.mapping {
         print_mapping(&map);
     }
-
-    // Export dictionary if requested
     if cli.dictionary {
-        let (dict_dir, in_output) = match &cli.dict_output {
-            Some(p) => (p.clone(), false),
-            None => (cli.output_directory.clone(), true),
-        };
-        if !dict_dir.exists() {
+        export_dictionary_for_cli(&map, cli, file_count)?;
+    }
+
+    let path_pairs = collect_path_replacement_pairs(&map);
+
+    // Phase 2: write
+    if let Some(out_zip) = &cli.output_zip {
+        if out_zip.exists() && !cli.force {
+            anyhow::bail!(
+                "Output zip {} already exists. Use -f to overwrite.",
+                out_zip.display()
+            );
+        }
+        write_zip_output(&zip_path, out_zip, &map, exclude, &path_pairs, cli)?;
+        println!("\n  Output zip: {}", out_zip.display());
+    } else {
+        let out_dir = cli.require_output_dir()?;
+        if !out_dir.exists() {
             if cli.force {
-                fs::create_dir_all(&dict_dir).with_context(|| {
-                    format!("Failed to create dict directory: {}", dict_dir.display())
-                })?;
+                fs::create_dir_all(out_dir)
+                    .with_context(|| format!("Failed to create: {}", out_dir.display()))?;
             } else {
                 anyhow::bail!(
-                    "Dictionary directory does not exist: {}. Use -f to create it.",
-                    dict_dir.display()
+                    "Output directory does not exist: {}. Use -f to create it.",
+                    out_dir.display()
                 );
             }
         }
-        let dict_path = export_dictionary(&map, &dict_dir, files.len())?;
-        println!("  Dictionary: {}", dict_path.display());
-        if in_output {
-            eprintln!(
-                "  ⚠ WARNING: dictionary is inside the OUTPUT directory ({}).",
-                cli.output_directory.display()
-            );
-            eprintln!(
-                "  ⚠ Do NOT include it in your support bundle — it can reverse the anonymization."
-            );
-            eprintln!("  ⚠ Use --dict-output <DIR> next time to keep it separate.\n");
-        } else {
-            println!();
-        }
+        extract_zip_output(&zip_path, out_dir, &map, exclude, &path_pairs, cli)?;
+        println!("\n  Output: {}", out_dir.display());
     }
 
-    // Phase 2: Anonymize files
-    process_files(&files, &map, &exclude, &cli)?;
-
-    // Paranoid mode: re-scan output to detect leaked entities
     if cli.paranoid {
-        let leaks = paranoid_rescan(&files, &map, &cli)?;
-        if leaks > 0 {
-            eprintln!(
-                "\n  ⚠ PARANOID CHECK: {} potentially sensitive entities found in output files",
-                leaks
-            );
-            eprintln!("  ⚠ Review output before sharing. This may indicate false negatives in detection regexes.");
-        } else {
-            println!("\n  ✓ Paranoid check: no leaked entities detected in output.");
+        eprintln!("\n  ℹ --paranoid is not applied to .zip output in this version (the same");
+        eprintln!("     detection engine is used; extract and re-run with -d to paranoid-check).");
+    }
+
+    Ok(EXIT_OK)
+}
+
+/// Transform one zip entry's bytes: anonymize `.log` content, copy others.
+fn transform_entry(
+    name: &str,
+    bytes: Vec<u8>,
+    map: &AnonymizationMap,
+    exclude: &ExcludeFilter,
+) -> Vec<u8> {
+    if entry_is_log(name) {
+        let content = decode_bytes(&bytes);
+        apply_replacements(&content, map, exclude).into_bytes()
+    } else {
+        bytes
+    }
+}
+
+/// Repack: read each entry, anonymize, write into a new zip preserving the
+/// (anonymized) tree and last-modified timestamps. One entry at a time.
+fn write_zip_output(
+    zip_path: &Path,
+    out_zip: &Path,
+    map: &AnonymizationMap,
+    exclude: &ExcludeFilter,
+    path_pairs: &[(String, String)],
+    cli: &Cli,
+) -> Result<()> {
+    use std::io::{Read, Write};
+    let in_file = fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(in_file)?;
+
+    if let Some(parent) = out_zip.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() && cli.force {
+            fs::create_dir_all(parent)?;
         }
     }
+    let out_file = fs::File::create(out_zip)
+        .with_context(|| format!("Failed to create output zip: {}", out_zip.display()))?;
+    let mut writer = zip::ZipWriter::new(out_file);
 
-    // Show statistics if requested
-    let elapsed = start.elapsed();
-    if cli.stats {
-        print_statistics(&map, files.len(), elapsed);
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let name = entry.name().to_string();
+        let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names);
+
+        let mut options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        if let Some(mtime) = entry.last_modified() {
+            options = options.last_modified_time(mtime);
+        }
+
+        if entry.is_dir() {
+            writer.add_directory(anon_name, options)?;
+            continue;
+        }
+
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes)?;
+        let out_bytes = transform_entry(&name, bytes, map, exclude);
+
+        writer.start_file(anon_name, options)?;
+        writer.write_all(&out_bytes)?;
     }
 
-    // Summary
-    println!(
-        "\n  Anonymization complete: {} files, {} entities in {:.2}s",
-        files.len(),
-        map.total_entities(),
-        elapsed.as_secs_f64()
-    );
-    println!("  Output: {}", cli.output_directory.display());
+    writer.finish()?;
+    Ok(())
+}
 
+/// Extract: write each entry anonymized into `out_dir`, preserving the
+/// (anonymized) tree.
+fn extract_zip_output(
+    zip_path: &Path,
+    out_dir: &Path,
+    map: &AnonymizationMap,
+    exclude: &ExcludeFilter,
+    path_pairs: &[(String, String)],
+    cli: &Cli,
+) -> Result<()> {
+    use std::io::Read;
+    let in_file = fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(in_file)?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names);
+        let out_path = out_dir.join(&anon_name);
+
+        if let Some(parent) = out_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        if out_path.exists() && !cli.force {
+            anyhow::bail!(
+                "Output file {} already exists. Use -f to overwrite.",
+                out_path.display()
+            );
+        }
+
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes)?;
+        let out_bytes = transform_entry(&name, bytes, map, exclude);
+        fs::write(&out_path, &out_bytes)
+            .with_context(|| format!("Failed to write: {}", out_path.display()))?;
+    }
     Ok(())
 }
 
