@@ -1,4 +1,4 @@
-//! VeeamLogAnonymizer — Rust Edition v2.4
+//! VeeamLogAnonymizer — Rust Edition v2.5
 //!
 //! High-performance anonymization tool for Veeam Backup & Replication logs.
 //!
@@ -715,6 +715,16 @@ struct Cli {
     /// (one per line). Exact whole-word matches.
     #[arg(long = "db-list", value_name = "FILE")]
     db_list: Option<PathBuf>,
+
+    /// Keep original file and directory names in the output (opt-out).
+    /// By default, sensitive entities (hostnames, VM/object names, FQDNs,
+    /// backup file names, …) found in file/directory names are anonymized
+    /// too — recognizable prefixes (Task./Agent./Svc.) and the .log
+    /// extension are preserved. Use this flag to disable path renaming.
+    /// Note: IPv4/IPv6/MAC/DOMAIN\user are never altered in path names
+    /// (their masked forms contain characters invalid in filenames).
+    #[arg(long = "keep-path-names")]
+    keep_path_names: bool,
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1268,9 +1278,21 @@ fn extract_entities(content: &str, cfg: &ExtractConfig) -> ExtractedEntities {
 
     // Extract DOMAIN\username
     for cap in RE_DOMAIN_USER.captures_iter(content) {
-        if let Some(user_match) = cap.get(2) {
-            let username = user_match.as_str().to_string();
-            if is_valid_username(&username) {
+        if let (Some(domain_match), Some(user_match)) = (cap.get(1), cap.get(2)) {
+            let domain = domain_match.as_str();
+            let username = user_match.as_str();
+            // Reject when the "domain" segment is actually a file extension.
+            // Backup-file paths like "disk.vib\next" or "chain.vbk\n1024" make
+            // the DOMAIN\user regex fire with domain = vib/vbk/vbm/vrb/... — a
+            // false positive that --paranoid then re-flags as a leak (issue #2),
+            // because the backup-file stem replacement keeps the ".vib\..." tail.
+            if FILE_EXTENSIONS
+                .iter()
+                .any(|&ext| domain.eq_ignore_ascii_case(ext))
+            {
+                continue;
+            }
+            if is_valid_username(username) {
                 if let Some(full_match) = cap.get(0) {
                     out.domain_users.insert(full_match.as_str().to_string());
                 }
@@ -1470,6 +1492,7 @@ fn collect_entities(
     input_files: &[PathBuf],
     exclude: &ExcludeFilter,
     extract_cfg: &ExtractConfig,
+    base_dir: Option<&Path>,
     verbose: bool,
 ) -> Result<AnonymizationMap> {
     let scan_bar = make_scan_bar(input_files.len() as u64);
@@ -1484,10 +1507,28 @@ fn collect_entities(
                     scan_bar.set_message(name.to_string());
                 }
             }
-            match read_file_smart(file) {
+            let mut entities = match read_file_smart(file) {
                 Ok(content) => extract_entities(&content, extract_cfg),
                 Err(_) => ExtractedEntities::default(),
+            };
+            // Also scan the (relative) path name itself: an email / FQDN / IP /
+            // backup-file present ONLY in a file or directory name must still be
+            // detected so it can be anonymized in the output path. Short bare
+            // hostnames remain non-auto-detectable by design — provide them via
+            // --hostname-list / --object-list.
+            let rel = relative_path_str(file, base_dir);
+            if !rel.is_empty() {
+                entities.merge(extract_entities(&rel, extract_cfg));
+                // Also scan with the trailing file extension stripped: a FQDN
+                // at the end of a name (host.example.com.log) would otherwise be
+                // swallowed by the ".log" extension and rejected (TLD "log").
+                if let Some((stem, _ext)) = rel.rsplit_once('.') {
+                    if stem != rel && stem.contains('.') {
+                        entities.merge(extract_entities(stem, extract_cfg));
+                    }
+                }
             }
+            entities
         })
         .reduce(ExtractedEntities::default, |mut acc, item| {
             acc.merge(item);
@@ -1921,6 +1962,32 @@ fn collect_replacement_pairs(map: &AnonymizationMap) -> Vec<(String, String)> {
     pairs
 }
 
+/// Collect only the (original, replacement) pairs whose replacement value is
+/// safe to use inside a file or directory name. Excludes IPv4/IPv6/MAC
+/// (masked forms contain `*` and `:`) and DOMAIN\user (contains `\`), all of
+/// which are invalid in path components on Windows. PEM/JWT/SSH are content-only
+/// and never appear in the literal map. Sorted longest-first (maximal munch).
+fn collect_path_replacement_pairs(map: &AnonymizationMap) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let sections: &[&HashMap<String, String>] = &[
+        &map.emails,
+        &map.domains,
+        &map.naked_users,
+        &map.fqdns,
+        &map.backup_files,
+        &map.hostnames,
+        &map.objects,
+        &map.dbs,
+    ];
+    for section in sections {
+        for (orig, anon) in *section {
+            pairs.push((orig.clone(), anon.clone()));
+        }
+    }
+    pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
+    pairs
+}
+
 /// Apply literal replacements using Aho-Corasick (case-insensitive, leftmost-longest).
 /// This is the single-pass engine; replacement values are never re-matched.
 fn apply_pairs(content: &str, pairs: &[(String, String)]) -> String {
@@ -1968,12 +2035,16 @@ fn process_files(
 ) -> Result<()> {
     let anon_bar = make_anon_bar(input_files.len() as u64);
 
+    // Path-safe replacement pairs for anonymizing file/directory names.
+    let path_pairs = collect_path_replacement_pairs(map);
+
     input_files
         .par_iter()
         .progress_with(anon_bar.clone())
         .try_for_each(|input_file| -> Result<()> {
-            // Compute output path (preserving subdirectory structure)
-            let output_file = compute_output_path(input_file, cli);
+            // Compute output path (preserving subdirectory structure, with
+            // sensitive entities in path names anonymized unless --keep-path-names)
+            let output_file = compute_output_path(input_file, cli, &path_pairs);
 
             // Create parent directories if needed
             if let Some(parent) = output_file.parent() {
@@ -2016,20 +2087,61 @@ fn process_files(
     Ok(())
 }
 
-/// Compute the output file path, preserving directory structure
-fn compute_output_path(input_file: &Path, cli: &Cli) -> PathBuf {
-    if cli.input_file.is_some() {
-        // Single file mode: output to output_dir/filename
-        let filename = input_file.file_name().unwrap_or_default();
-        cli.output_directory.join(filename)
-    } else if let Some(ref input_dir) = cli.input_directory {
-        // Directory mode: preserve relative path
-        let relative = input_file.strip_prefix(input_dir).unwrap_or(input_file);
-        cli.output_directory.join(relative)
-    } else {
-        let filename = input_file.file_name().unwrap_or_default();
-        cli.output_directory.join(filename)
+/// Return the path of `input_file` relative to `base_dir` as a lossy string.
+/// If `base_dir` is None (single-file mode), returns just the file name.
+/// Used both for scanning path names and for anonymizing the output path.
+fn relative_path_str(input_file: &Path, base_dir: Option<&Path>) -> String {
+    match base_dir {
+        Some(base) => input_file
+            .strip_prefix(base)
+            .unwrap_or(input_file)
+            .to_string_lossy()
+            .into_owned(),
+        None => input_file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     }
+}
+
+/// Anonymize each component of a relative path using the path-safe replacement
+/// pairs, then rebuild the path. Directory and file names are both processed.
+/// The `.log` extension and recognizable prefixes (Task./Agent./Svc.) survive
+/// because they are not entities. Returns the relative anonymized PathBuf.
+fn anonymize_relative_path(relative: &Path, path_pairs: &[(String, String)]) -> PathBuf {
+    if path_pairs.is_empty() {
+        return relative.to_path_buf();
+    }
+    let mut out = PathBuf::new();
+    for component in relative.components() {
+        let part = component.as_os_str().to_string_lossy();
+        let anon = apply_pairs(&part, path_pairs);
+        out.push(anon);
+    }
+    out
+}
+
+/// Compute the output file path, preserving directory structure and (unless
+/// `--keep-path-names`) anonymizing sensitive entities in path components.
+fn compute_output_path(input_file: &Path, cli: &Cli, path_pairs: &[(String, String)]) -> PathBuf {
+    // Relative path under the output directory (file name in single-file mode).
+    let relative: PathBuf = if let Some(ref input_dir) = cli.input_directory {
+        input_file
+            .strip_prefix(input_dir)
+            .unwrap_or(input_file)
+            .to_path_buf()
+    } else {
+        PathBuf::from(input_file.file_name().unwrap_or_default())
+    };
+
+    // Anonymize path components unless the user opted out.
+    let relative = if cli.keep_path_names {
+        relative
+    } else {
+        anonymize_relative_path(&relative, path_pairs)
+    };
+
+    cli.output_directory.join(relative)
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2286,6 +2398,30 @@ fn reverse_anonymize(dict_path: &Path, input_files: &[PathBuf], cli: &Cli) -> Re
 
     println!("  Loaded {} mappings from dictionary", reverse_pairs.len());
 
+    // Reverse path-safe pairs (anonymized → original) to restore the original
+    // file/directory names. Mirrors collect_path_replacement_pairs: only the
+    // sections whose replacement is path-safe are eligible.
+    let path_safe_sections: &[&Vec<DictEntry>] = &[
+        &dict.mappings.emails,
+        &dict.mappings.domains,
+        &dict.mappings.naked_users,
+        &dict.mappings.fqdns,
+        &dict.mappings.backup_files,
+        &dict.mappings.hostnames,
+        &dict.mappings.objects,
+        &dict.mappings.dbs,
+    ];
+    let mut reverse_path_pairs: Vec<(String, String)> = Vec::new();
+    for section in path_safe_sections {
+        for entry in *section {
+            if entry.anonymized.contains("[REDACTED") {
+                continue;
+            }
+            reverse_path_pairs.push((entry.anonymized.clone(), entry.original.clone()));
+        }
+    }
+    reverse_path_pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
+
     let anon_bar = make_anon_bar(input_files.len() as u64);
     anon_bar.set_prefix("[1/1] Reversing ");
 
@@ -2293,7 +2429,7 @@ fn reverse_anonymize(dict_path: &Path, input_files: &[PathBuf], cli: &Cli) -> Re
         .par_iter()
         .progress_with(anon_bar.clone())
         .try_for_each(|input_file| -> Result<()> {
-            let output_file = compute_output_path(input_file, cli);
+            let output_file = compute_output_path(input_file, cli, &reverse_path_pairs);
 
             if let Some(parent) = output_file.parent() {
                 if !parent.exists() && cli.force {
@@ -2378,29 +2514,55 @@ fn paranoid_rescan(input_files: &[PathBuf], map: &AnonymizationMap, cli: &Cli) -
         Err(_) => return Ok(0),
     };
 
+    // Path-safe pairs are used to locate the (possibly renamed) output file.
+    let path_pairs = collect_path_replacement_pairs(map);
+
+    // Word-boundary leak scan helper, shared by content and path-name checks.
+    let scan_leaks = |text: &str, sink: &mut HashSet<usize>| {
+        let bytes = text.as_bytes();
+        for mat in ac.find_iter(text) {
+            // Require word-boundary on both sides to avoid matching
+            // 'name' inside 'username', 'filename', etc.
+            let start = mat.start();
+            let end = mat.end();
+            let left_is_boundary =
+                start == 0 || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
+            let right_is_boundary =
+                end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_';
+            if left_is_boundary && right_is_boundary {
+                sink.insert(mat.pattern().as_usize());
+            }
+        }
+    };
+
     let total_leaks: usize = input_files
         .par_iter()
         .map(|input_file| -> usize {
-            let output_file = compute_output_path(input_file, cli);
+            let output_file = compute_output_path(input_file, cli, &path_pairs);
+
+            // Check the output path NAME itself (file + directory components).
+            // Catches sensitive tokens — e.g. short hostnames not provided via
+            // --hostname-list — still present in a renamed path.
+            let mut name_leaks: HashSet<usize> = HashSet::new();
+            let rel_name = output_file
+                .strip_prefix(&cli.output_directory)
+                .unwrap_or(&output_file)
+                .to_string_lossy();
+            scan_leaks(&rel_name, &mut name_leaks);
+            for &idx in &name_leaks {
+                eprintln!(
+                    "  ⚠ Leak detected in path name {}: '{}' still present",
+                    output_file.display(),
+                    originals[idx]
+                );
+            }
+
             let content = match read_file_smart(&output_file) {
                 Ok(c) => c,
-                Err(_) => return 0,
+                Err(_) => return name_leaks.len(),
             };
-            let bytes = content.as_bytes();
             let mut leaks_in_file: HashSet<usize> = HashSet::new();
-            for mat in ac.find_iter(&content) {
-                // Require word-boundary on both sides to avoid matching
-                // 'name' inside 'username', 'filename', etc.
-                let start = mat.start();
-                let end = mat.end();
-                let left_is_boundary = start == 0
-                    || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
-                let right_is_boundary =
-                    end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_';
-                if left_is_boundary && right_is_boundary {
-                    leaks_in_file.insert(mat.pattern().as_usize());
-                }
-            }
+            scan_leaks(&content, &mut leaks_in_file);
             for &idx in &leaks_in_file {
                 eprintln!(
                     "  ⚠ Leak detected in {}: '{}' still present",
@@ -2408,7 +2570,7 @@ fn paranoid_rescan(input_files: &[PathBuf], map: &AnonymizationMap, cli: &Cli) -
                     originals[idx]
                 );
             }
-            leaks_in_file.len()
+            leaks_in_file.len() + name_leaks.len()
         })
         .sum();
 
@@ -2504,8 +2666,14 @@ fn main() -> Result<()> {
         }
     }
 
-    // Phase 1: Scan and collect entities
-    let map = collect_entities(&files, &exclude, &extract_cfg, cli.verbose)?;
+    // Phase 1: Scan and collect entities (content + path names)
+    let map = collect_entities(
+        &files,
+        &exclude,
+        &extract_cfg,
+        cli.input_directory.as_deref(),
+        cli.verbose,
+    )?;
 
     println!(
         "\n  Found: {} emails, {} users, {} domains, {} IPv4, {} IPv6, {} MACs",
@@ -2810,6 +2978,19 @@ mod tests {
         assert!(domain_users
             .iter()
             .any(|u| u.to_lowercase().contains("john.doe")));
+    }
+
+    #[test]
+    fn domain_user_rejects_backup_extension_false_positive() {
+        // issue #2: backup-file paths like "disk.vib\next" / "chain.vbk\n1024"
+        // must NOT be captured as DOMAIN\user (domain segment = file extension).
+        let content = "Restore disk foo.vib\\next started; chain chain.vbk\\n1024 verified";
+        let (_, domain_users, _, _) = extract_legacy(content);
+        assert!(
+            domain_users.is_empty(),
+            "no domain users expected, got: {:?}",
+            domain_users
+        );
     }
 
     #[test]
