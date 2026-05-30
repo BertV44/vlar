@@ -61,6 +61,34 @@ This tool's detection scope follows the categories listed in [KB2462](https://ww
 - **Flexible**: Exclude specific entity types with `--exclude`, opt-in aggressive detection with `--aggressive`
 - **Safe**: Paranoid re-scan mode + collision detection on generated values
 
+## What's new in v2.5
+
+### File & directory name anonymization
+
+Resolves [issue #1](https://github.com/BertV44/vlar/issues/1): sensitive entities in
+**file and directory names** (e.g. `Task.HOSTNAME-vm....log`, or a folder named after a VM/job)
+were copied verbatim into the output. They are now anonymized too.
+
+- **On by default**: path components are anonymized using the same consistent, reversible
+  mappings as the file content. Recognizable prefixes (`Task.`, `Agent.`, `Svc.`) and the
+  `.log` extension are preserved — only the sensitive token is replaced.
+- **Path names are also scanned**: an email / FQDN / IP / backup-file name present *only* in a
+  path (never in content) is now auto-detected and anonymized.
+- **Reversible**: `--reverse` restores the original file and directory names along with content.
+- **`--paranoid`** also re-scans output path names and flags any leaked entity still present.
+- **Opt-out**: `--keep-path-names` keeps original names (content is still anonymized).
+- **Limitation (by design)**: IPv4/IPv6/MAC/`DOMAIN\user` are *not* altered in path names — their
+  masked forms contain characters (`*`, `:`, `\`) invalid in filenames. Short bare hostnames in
+  names still require `--hostname-list` / `--object-list` (not reliably auto-detectable), per the
+  tool's "miss rather than corrupt" philosophy.
+
+### Paranoid false-positive fix
+
+Resolves [issue #2](https://github.com/BertV44/vlar/issues/2): backup-file paths such as
+`disk.vib\next` or `chain.vbk\n1024` were wrongly captured as `DOMAIN\user` (the "domain"
+segment being a file extension), then re-flagged by `--paranoid` as leaks. The `DOMAIN\user`
+detector now rejects matches whose domain segment is a known file extension.
+
 ## What's new in v2.4
 
 Major coverage upgrade aligned with [Veeam KB2462](https://www.veeam.com/kb2462):
@@ -192,6 +220,7 @@ veeam-log-anonymizer -d ./logs -o ./output -f -e pem
 |  | `--hostname-list FILE` | Explicit list of short hostnames |
 |  | `--object-list FILE` | Explicit list of customer object names (VMs, datastores, hosts) |
 |  | `--db-list FILE` | Explicit list of database names |
+|  | `--keep-path-names` | Keep original file/directory names (path anonymization is on by default) |
 
 ### `--exclude` accepted types
 

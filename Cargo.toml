@@ -1,6 +1,6 @@
 [package]
 name = "veeam-log-anonymizer"
-version = "2.4.0"
+version = "2.5.0"
 edition = "2021"
 authors = [
     "Bertrand Castagnet <EMEA TAM at Veeam France>",

@@ -2,6 +2,7 @@
 //! Run with: cargo test --test integration_test
 
 use std::fs;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 fn bin() -> String {
@@ -13,6 +14,35 @@ fn run(args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("Failed to run binary")
+}
+
+/// Recursively collect every file path under `dir`.
+fn collect_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                out.extend(collect_files(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Relative-to-`base` path strings of every file under `base` (slash-normalized).
+fn rel_paths(base: &Path) -> Vec<String> {
+    collect_files(base)
+        .iter()
+        .map(|p| {
+            p.strip_prefix(base)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect()
 }
 
 #[test]
@@ -1005,5 +1035,338 @@ fn kb2462_reference_in_banner() {
         stdout.contains("KB2462"),
         "Banner must cite Veeam KB2462. Got: {}",
         stdout
+    );
+}
+
+#[test]
+fn paranoid_no_false_positive_on_backup_extension() {
+    // issue #2: "disk.vib\next" / "chain.vbk\n1024" were wrongly detected as
+    // DOMAIN\user and then re-flagged by --paranoid as leaks.
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("restore.log"),
+        "Restore disk foo.vib\\next started\nChain chain.vbk\\n1024 verified\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--paranoid",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("Leak detected"),
+        "paranoid must not flag backup-extension false positives. Output: {}",
+        combined
+    );
+    // Backup file stems are still anonymized; the ".vib"/".vbk" tails remain.
+    let content = fs::read_to_string(output_dir.path().join("restore.log")).unwrap();
+    assert!(
+        !content.contains("foo.vib"),
+        "stem must be replaced: {}",
+        content
+    );
+    assert!(
+        !content.contains("chain.vbk"),
+        "stem must be replaced: {}",
+        content
+    );
+}
+
+// ── Path-name anonymization (issue #1) ──────────────────────────────
+
+#[test]
+fn path_filename_hostname_anonymized() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    let list_dir = TempDir::new().unwrap();
+    let list_file = list_dir.path().join("hosts.txt");
+
+    fs::write(&list_file, "vsa1\n").unwrap();
+    // Hostname appears in the FILE NAME and in the content.
+    fs::write(
+        input_dir.path().join("Task.vsa1-backup.log"),
+        "Source host vsa1 connected\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--hostname-list",
+        list_file.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let names = rel_paths(output_dir.path());
+    assert_eq!(names.len(), 1, "expected one output file, got {:?}", names);
+    let name = &names[0];
+    assert!(
+        !name.contains("vsa1"),
+        "Hostname must be removed from the file name. Got: {}",
+        name
+    );
+    // Recognizable prefix and extension preserved.
+    assert!(name.starts_with("Task."), "prefix preserved. Got: {}", name);
+    assert!(name.ends_with(".log"), "extension preserved. Got: {}", name);
+
+    let content = fs::read_to_string(output_dir.path().join(name)).unwrap();
+    assert!(
+        !content.contains("vsa1"),
+        "content anonymized. Got: {}",
+        content
+    );
+}
+
+#[test]
+fn path_directory_object_anonymized() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    let list_dir = TempDir::new().unwrap();
+    let list_file = list_dir.path().join("objects.txt");
+
+    fs::write(&list_file, "prod-vm01\n").unwrap();
+    // Object name appears as a DIRECTORY name.
+    let sub = input_dir.path().join("prod-vm01");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("agent.log"), "job started\n").unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--object-list",
+        list_file.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let names = rel_paths(output_dir.path());
+    assert_eq!(names.len(), 1, "expected one output file, got {:?}", names);
+    assert!(
+        !names[0].contains("prod-vm01"),
+        "Object name must be removed from the directory path. Got: {}",
+        names[0]
+    );
+    assert!(
+        names[0].ends_with("agent.log"),
+        "leaf file name preserved (not an entity). Got: {}",
+        names[0]
+    );
+}
+
+#[test]
+fn path_fqdn_autodetected_in_name() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    // FQDN present ONLY in the file name, nowhere in content.
+    fs::write(
+        input_dir.path().join("Agent.host.example.com.log"),
+        "nothing sensitive in here\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let names = rel_paths(output_dir.path());
+    assert_eq!(names.len(), 1, "expected one output file, got {:?}", names);
+    assert!(
+        !names[0].contains("host.example.com"),
+        "FQDN in file name must be auto-detected and anonymized. Got: {}",
+        names[0]
+    );
+}
+
+#[test]
+fn path_keep_path_names_optout() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    let list_dir = TempDir::new().unwrap();
+    let list_file = list_dir.path().join("hosts.txt");
+
+    fs::write(&list_file, "vsa1\n").unwrap();
+    fs::write(
+        input_dir.path().join("Task.vsa1-backup.log"),
+        "Source host vsa1 connected\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--hostname-list",
+        list_file.to_str().unwrap(),
+        "--keep-path-names",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // File name kept verbatim …
+    let kept = output_dir.path().join("Task.vsa1-backup.log");
+    assert!(
+        kept.exists(),
+        "--keep-path-names must preserve the file name"
+    );
+    // … but content is still anonymized.
+    let content = fs::read_to_string(&kept).unwrap();
+    assert!(
+        !content.contains("vsa1"),
+        "content still anonymized with --keep-path-names. Got: {}",
+        content
+    );
+}
+
+#[test]
+fn path_round_trip_reverse_restores_names() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    let restored_dir = TempDir::new().unwrap();
+    let dict_dir = TempDir::new().unwrap();
+    let list_dir = TempDir::new().unwrap();
+    let list_file = list_dir.path().join("hosts.txt");
+
+    fs::write(&list_file, "vsa1\n").unwrap();
+    let original_content = "Source host vsa1 connected\n";
+    fs::write(
+        input_dir.path().join("Task.vsa1-backup.log"),
+        original_content,
+    )
+    .unwrap();
+
+    // Forward: anonymize + export dictionary to a separate directory.
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "-D",
+        "--dict-output",
+        dict_dir.path().to_str().unwrap(),
+        "--hostname-list",
+        list_file.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "forward stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The anonymized name must differ from the original.
+    let anon_names = rel_paths(output_dir.path());
+    assert_eq!(anon_names.len(), 1);
+    assert!(!anon_names[0].contains("vsa1"));
+
+    // Find the exported dictionary file.
+    let dict = collect_files(dict_dir.path())
+        .into_iter()
+        .find(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+        .expect("dictionary json must exist");
+
+    // Reverse: feed the anonymized output back through --reverse.
+    let out = run(&[
+        "-d",
+        output_dir.path().to_str().unwrap(),
+        "-o",
+        restored_dir.path().to_str().unwrap(),
+        "-f",
+        "--reverse",
+        dict.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "reverse stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Original file name AND content are restored.
+    let restored = restored_dir.path().join("Task.vsa1-backup.log");
+    assert!(
+        restored.exists(),
+        "reverse must restore the original file name. Got: {:?}",
+        rel_paths(restored_dir.path())
+    );
+    assert_eq!(fs::read_to_string(&restored).unwrap(), original_content);
+}
+
+#[test]
+fn paranoid_flags_leak_in_kept_path_name() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    let list_dir = TempDir::new().unwrap();
+    let list_file = list_dir.path().join("hosts.txt");
+
+    fs::write(&list_file, "prod-host-01\n").unwrap();
+    fs::write(
+        input_dir.path().join("Task.prod-host-01.log"),
+        "Source host prod-host-01 connected\n",
+    )
+    .unwrap();
+
+    // With --keep-path-names the sensitive token stays in the file name;
+    // --paranoid must flag it as a path-name leak.
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--hostname-list",
+        list_file.to_str().unwrap(),
+        "--keep-path-names",
+        "--paranoid",
+    ]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("path name") && stderr.contains("prod-host-01"),
+        "paranoid must report the leaked hostname in the path name. stderr: {}",
+        stderr
     );
 }
