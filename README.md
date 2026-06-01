@@ -30,15 +30,15 @@ This tool's detection scope follows the categories listed in [KB2462](https://ww
 
 ### KB2462 coverage matrix (VBR)
 
-| KB2462 sensitive data type | v2.4 status |
+| KB2462 sensitive data type | v2.6 status |
 |---|---|
 | User names | ✅ DOMAIN\user, .\user, --aggressive naked-user, --user-list |
 | Object names (hosts, datastores, VMs, clusters) | ✅ via `--object-list` |
-| VM file names and paths | 🟡 backup files only (.vbk/.vib/.vbm/.vrb); generic paths via lists |
+| VM file names and paths | ✅ backup files (.vbk/.vib/.vbm/.vrb) + file/directory **names** anonymized (v2.5); other objects via lists |
 | FQDN / Hostname / NetBIOS names | ✅ FQDN via `--aggressive`, short hostnames via `--hostname-list` |
 | IPv4 addresses | ✅ |
 | IPv6 addresses | ✅ |
-| Customer-specific paths to backup files | 🟡 file names yes, path prefix on roadmap |
+| Customer-specific paths to backup files | ✅ file & directory **names** anonymized in output paths (v2.5) |
 | Names of backup files | ✅ |
 | SharePoint / Exchange / SQL / Oracle / PostgreSQL / MongoDB / SAP HANA | 🟡 DB names via `--db-list` |
 | Query execution results | ❌ out of scope (would corrupt logs) |
