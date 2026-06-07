@@ -1,4 +1,4 @@
-//! VeeamLogAnonymizer — Rust Edition v2.6
+//! VeeamLogAnonymizer — Rust Edition v2.6.1
 //!
 //! High-performance anonymization tool for Veeam Backup & Replication logs.
 //!
@@ -746,11 +746,11 @@ struct Cli {
 
     /// Keep original file and directory names in the output (opt-out).
     /// By default, sensitive entities (hostnames, VM/object names, FQDNs,
-    /// backup file names, …) found in file/directory names are anonymized
-    /// too — recognizable prefixes (Task./Agent./Svc.) and the .log
+    /// backup file names, IPv4/IPv6/MAC, …) found in file/directory names are
+    /// anonymized too — recognizable prefixes (Task./Agent./Svc.) and the .log
     /// extension are preserved. Use this flag to disable path renaming.
-    /// Note: IPv4/IPv6/MAC/DOMAIN\user are never altered in path names
-    /// (their masked forms contain characters invalid in filenames).
+    /// Note: IP/MAC use a filesystem-safe rendering in names (e.g. 10.0.0.21 ->
+    /// xx.xx.0.21) and are one-way (not reversible), as in content.
     #[arg(long = "keep-path-names")]
     keep_path_names: bool,
 
@@ -1347,8 +1347,23 @@ fn extract_entities(content: &str, cfg: &ExtractConfig) -> ExtractedEntities {
             {
                 continue;
             }
-            if is_valid_username(username) {
-                if let Some(full_match) = cap.get(0) {
+            // Reject Windows path segments: a "word\word" flanked by another
+            // path separator (e.g. ...\VeeamBackup\Backup_Job_1\... or
+            // \ResourceScan\Task_host_...) is a directory path, not a real
+            // DOMAIN\user account. Genuine DOMAIN\user tokens are surrounded by
+            // whitespace/punctuation, not by '\' or '/'. (Avoids the path-leak
+            // false positives seen in real bundles.)
+            if let Some(full_match) = cap.get(0) {
+                let start = full_match.start();
+                let end = full_match.end();
+                let before = content[..start].chars().next_back();
+                let after = content[end..].chars().next();
+                if matches!(before, Some('\\') | Some('/'))
+                    || matches!(after, Some('\\') | Some('/'))
+                {
+                    continue;
+                }
+                if is_valid_username(username) {
                     out.domain_users.insert(full_match.as_str().to_string());
                 }
             }
@@ -2037,30 +2052,38 @@ fn collect_replacement_pairs(map: &AnonymizationMap) -> Vec<(String, String)> {
     pairs
 }
 
-/// Collect only the (original, replacement) pairs whose replacement value is
-/// safe to use inside a file or directory name. Excludes IPv4/IPv6/MAC
-/// (masked forms contain `*` and `:`) and DOMAIN\user (contains `\`), all of
-/// which are invalid in path components on Windows. PEM/JWT/SSH are content-only
-/// and never appear in the literal map. Sorted longest-first (maximal munch).
+/// Collect (original, filesystem-safe replacement) pairs for anonymizing file
+/// and directory names. Covers every entity kind in the literal map; IPv4/IPv6/
+/// MAC masks (which contain `*`/`:`) and DOMAIN\user (`\`) are rendered through
+/// `to_path_safe` so they are valid in Windows path components. PEM/JWT are
+/// content-only (regex) and never appear in the literal map. Longest-first.
 fn collect_path_replacement_pairs(map: &AnonymizationMap) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    let sections: &[&HashMap<String, String>] = &[
-        &map.emails,
-        &map.domains,
-        &map.naked_users,
-        &map.fqdns,
-        &map.backup_files,
-        &map.hostnames,
-        &map.objects,
-        &map.dbs,
-    ];
-    for section in sections {
-        for (orig, anon) in *section {
-            pairs.push((orig.clone(), anon.clone()));
-        }
+    // Every entity kind may appear in a file/directory name, including IPv4,
+    // IPv6 and MAC (e.g. a directory literally named "10.0.0.21"). Their masked
+    // forms contain characters that are illegal in path components on Windows
+    // (`*`, `:`, `\`), so we render each replacement through `to_path_safe`.
+    // For the reversible kinds (hostnames, objects, FQDNs, …) the value is
+    // already path-safe so this is a no-op and reverse keeps working; IPv4/
+    // IPv6/MAC become one-way redactions in names, consistent with content.
+    let mut pairs = collect_replacement_pairs(map);
+    for pair in &mut pairs {
+        pair.1 = to_path_safe(&pair.1);
     }
     pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
     pairs
+}
+
+/// Make an anonymized replacement value safe to use inside a file or directory
+/// name: substitute characters that are illegal in Windows path components.
+fn to_path_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '*' => 'x',
+            ':' | '\\' | '/' => '-',
+            '?' | '"' | '<' | '>' | '|' => '_',
+            other => other,
+        })
+        .collect()
 }
 
 /// Apply literal replacements using Aho-Corasick (case-insensitive, leftmost-longest).
@@ -3722,6 +3745,38 @@ mod tests {
             "no domain users expected, got: {:?}",
             domain_users
         );
+    }
+
+    #[test]
+    fn domain_user_rejects_windows_path_segments() {
+        // v2.6.1: directory segments inside a Windows path must not be captured
+        // as DOMAIN\user (false positives seen in real bundles), but a genuine
+        // DOMAIN\user surrounded by whitespace must still be detected.
+        let content = "open C:\\Program Files\\Veeam\\VeeamBackup\\Backup_Job_1\\run.log \
+                       while CORP\\jdoe authenticated";
+        let (_, domain_users, _, _) = extract_legacy(content);
+        assert!(
+            domain_users
+                .iter()
+                .any(|u| u.to_lowercase() == "corp\\jdoe"),
+            "real DOMAIN\\user must be detected, got: {:?}",
+            domain_users
+        );
+        assert!(
+            !domain_users
+                .iter()
+                .any(|u| u.to_lowercase().contains("veeambackup\\backup_job_1")),
+            "Windows path segment must NOT be a domain user, got: {:?}",
+            domain_users
+        );
+    }
+
+    #[test]
+    fn to_path_safe_strips_illegal_chars() {
+        assert_eq!(to_path_safe("**.**.0.21"), "xx.xx.0.21");
+        assert_eq!(to_path_safe("**:**:**:**:**:21"), "xx-xx-xx-xx-xx-21");
+        // Reversible alphanumeric replacements are unchanged (no-op).
+        assert_eq!(to_path_safe("host-AbC123"), "host-AbC123");
     }
 
     #[test]

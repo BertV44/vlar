@@ -1701,3 +1701,96 @@ fn encrypt_dict_round_trip_env_passphrase() {
         stderr
     );
 }
+
+// ── v2.6.1: IP/IPv6/MAC anonymized in path names (path-safe) ─────────
+
+#[test]
+fn path_ip_directory_anonymized() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    // A directory literally named after an IP (real-world case).
+    let ip_dir = input_dir.path().join("Console").join("10.0.0.21");
+    fs::create_dir_all(&ip_dir).unwrap();
+    fs::write(ip_dir.join("task.log"), "target 10.0.0.21 reached\n").unwrap();
+    // A loopback dir must be left alone.
+    let lo = input_dir.path().join("Console").join("localhost");
+    fs::create_dir_all(&lo).unwrap();
+    fs::write(lo.join("x.log"), "noop\n").unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--paranoid",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let names = rel_paths(output_dir.path());
+    // The IP directory must be renamed to a filesystem-safe form (no '*').
+    assert!(
+        !names.iter().any(|n| n.contains("10.0.0.21")),
+        "IP directory must be anonymized in the output path. Got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n.contains("xx.xx.0.21")),
+        "IP directory should be rendered path-safe (xx.xx.0.21). Got: {:?}",
+        names
+    );
+    // Loopback directory preserved.
+    assert!(
+        names.iter().any(|n| n.contains("localhost")),
+        "localhost dir must be preserved. Got: {:?}",
+        names
+    );
+    // No '*' may ever appear in an output path component.
+    assert!(
+        !names.iter().any(|n| n.contains('*')),
+        "no '*' allowed in path names. Got: {:?}",
+        names
+    );
+
+    // Paranoid must not flag the (now-renamed) IP path.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("10.0.0.21"),
+        "paranoid must not report the IP as a leak. stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn paranoid_no_false_positive_on_windows_path_segments() {
+    // v2.6.1: "...\VeeamBackup\Backup_Job_1\..." path segments must not be
+    // treated as DOMAIN\user and re-flagged by --paranoid.
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    fs::write(
+        input_dir.path().join("svc.log"),
+        "open C:\\Program Files\\Veeam\\VeeamBackup\\Backup_Job_1\\run.log now\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--paranoid",
+    ]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Leak detected"),
+        "no path-segment false positives expected. stderr: {}",
+        stderr
+    );
+}
