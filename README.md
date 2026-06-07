@@ -61,6 +61,21 @@ This tool's detection scope follows the categories listed in [KB2462](https://ww
 - **Flexible**: Exclude specific entity types with `--exclude`, opt-in aggressive detection with `--aggressive`
 - **Safe**: Paranoid re-scan mode + collision detection on generated values
 
+## What's new in v2.6.1
+
+Fixes from real-world bundle testing:
+
+- **IPv4 / IPv6 / MAC are now anonymized in file and directory names too.** A folder literally
+  named `10.0.0.21` now becomes `xx.xx.0.21` in the output. Their masked forms contain characters
+  illegal in Windows path components (`*`, `:`, `\`), so a filesystem-safe rendering is used
+  (`*`→`x`, `:`→`-`). These remain **one-way redactions** in names (not reversible — consistent
+  with how IP/MAC masking already works in content). Loopback (`localhost`, `127.0.0.1`) is left
+  untouched as before.
+- **Fewer `--paranoid` false positives.** Windows path segments such as
+  `...\VeeamBackup\Backup_Job_1\...` were wrongly captured as `DOMAIN\user` and re-flagged as
+  leaks. A `word\word` pair flanked by another path separator is now treated as a path, not an
+  account. Genuine `DOMAIN\user` tokens (surrounded by whitespace) are still detected.
+
 ## What's new in v2.6
 
 Three backlog features, all shipped together.
@@ -128,10 +143,9 @@ were copied verbatim into the output. They are now anonymized too.
 - **Reversible**: `--reverse` restores the original file and directory names along with content.
 - **`--paranoid`** also re-scans output path names and flags any leaked entity still present.
 - **Opt-out**: `--keep-path-names` keeps original names (content is still anonymized).
-- **Limitation (by design)**: IPv4/IPv6/MAC/`DOMAIN\user` are *not* altered in path names — their
-  masked forms contain characters (`*`, `:`, `\`) invalid in filenames. Short bare hostnames in
-  names still require `--hostname-list` / `--object-list` (not reliably auto-detectable), per the
-  tool's "miss rather than corrupt" philosophy.
+- Short bare hostnames in names still require `--hostname-list` / `--object-list` (not reliably
+  auto-detectable), per the tool's "miss rather than corrupt" philosophy.
+- *(Updated in v2.6.1: IPv4/IPv6/MAC are now also anonymized in path names — see below.)*
 
 ### Paranoid false-positive fix
 
