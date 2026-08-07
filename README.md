@@ -127,17 +127,48 @@ A second pattern now handles the escaped form. Two details matter:
   escaped pair would turn `"ACME\\svc"` into `"XXXX\YYYY"`, an invalid JSON escape — the same
   corruption the v2.7 rule exists to avoid, from the other direction.
 
-Path segments are still left alone. In JSON-encoded text a Windows path is a run of
+Multi-segment paths are still left alone. In JSON-encoded text a Windows path is a run of
 `\\`-separated segments, so only a *doubled* neighbour marks a match as a path — testing for a
 single one would reject the common real case, since a `DOMAIN\\user` at the end of a JSON string
-is followed by the `\"` that closes it.
+is followed by the `\"` that closes it. `C:\\Program\\VeeamBackup\\Backup_Job_1\\run.log` and the
+UNC form `\\\\fileserver\\Backups` both survive untouched.
+
+> **Pre-existing false positive, now also reachable in JSON:** a *two-segment* path has no
+> adjacent separator to give it away, so `SOFTWARE\Veeam` or `Temp\report.html` is captured as if
+> it were an account and rewritten. This is not new — the same strings produce the same junk
+> mappings in a plain `.log`, via the single-backslash pattern, in every release so far. What v2.7.1
+> changes is only that the escaped spelling is now reachable too, so registry and relative paths in
+> `.trace` files join the ones already affected in `.log` files. It costs readability, not safety:
+> the replacement is consistent and reversible, and no customer data is exposed by it. Narrowing
+> this class needs its own change, since it alters plain-text behaviour as well.
 
 ```
 before:  {"m":"quoted \"ACME\\svc_veeam\" logged on"}   ->  unchanged, --paranoid clean
 after:   {"m":"quoted \"CEinQneP\\8KnzghAb2Y\" logged on"}
 ```
 
-`--reverse` restores the original bytes exactly. Closes #8.
+For the covered case, `--reverse` restores the original bytes exactly. Closes #8.
+
+> **Known gap:** the escaped-form pattern only runs where `ContentKind::for_name` selects
+> `JsonEscaped` — i.e. the file extension is `.trace` or `.json`. A `.log` or `.txt` file that
+> happens to carry a JSON payload (a common shape when a service logs a structured event into its
+> plain-text log) is scanned as `Plain`, so `DOMAIN\\user` inside it is *not* matched: the account
+> ships in clear and `--paranoid` reports the file clean, because detection never fires there in
+> the first place. One mitigating factor: replacement is entity-wide, not file-scoped — so if the
+> account is detected **from a `.trace` or `.json` file** anywhere in the bundle, the doubled-separator
+> key enters the map and every escaped occurrence is rewritten, including the ones hiding in `.log`
+> files. Note what does *not* help: detecting the same account in plain form elsewhere. A plain
+> match yields only the single-backslash key, which cannot match the doubled bytes — so an account
+> can be listed in the dictionary, rewritten in one `.log`, and still ship in clear from the escaped
+> payload in another, with `--paranoid` reporting clean and an exit code of 0. That is the most
+> misleading configuration, and the one to know about. Add such accounts to `--user-list` as a
+> stopgap — it replaces the naked username wherever it occurs, domain prefix and backslash count
+> notwithstanding:
+>
+> ```bash
+> echo 'svc_veeam' >> ~/.vla/users.txt
+> veeam-log-anonymizer -d ./logs -o ./anonymized --user-list ~/.vla/users.txt --paranoid
+> ```
 
 ## What's new in v2.6.1
 
