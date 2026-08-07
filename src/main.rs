@@ -30,10 +30,10 @@ use rand::Rng;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
@@ -47,6 +47,31 @@ const BANNER: &str = r#"
 
 /// Characters used for random string generation
 const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Extensions anonymized by default on directory input, lowercase, no dot.
+///
+/// Veeam bundles are not only `.log`: proxy traces are `.trace`, job reports are
+/// `.html`, and configuration dumps are `.xml`/`.config`. All of them carry the same
+/// hostnames, mailboxes and paths as the logs. Extend with `--ext`, replace with
+/// `--only-ext`.
+const DEFAULT_TEXT_EXTENSIONS: &[&str] = &[
+    "config", "csv", "err", "htm", "html", "json", "log", "out", "trace", "txt", "xml",
+];
+
+/// The extension set in force for this run, set once from the CLI in `main`.
+///
+/// A global is needed because the zip entry gate (`entry_is_text`) is reached from
+/// helpers that have no access to `Cli`. Falls back to the defaults if never set.
+static TEXT_EXTENSIONS: OnceLock<BTreeSet<String>> = OnceLock::new();
+
+fn active_text_extensions() -> &'static BTreeSet<String> {
+    TEXT_EXTENSIONS.get_or_init(|| {
+        DEFAULT_TEXT_EXTENSIONS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    })
+}
 
 /// File extensions that should NOT be treated as email TLDs
 const FILE_EXTENSIONS: &[&str] = &[
@@ -641,6 +666,24 @@ struct Cli {
     )]
     input_directory: Option<PathBuf>,
 
+    /// Additional text file extensions to anonymize, on top of the built-in set
+    /// (log, trace, txt, xml, html, htm, csv, json, config, err, out). Comma-
+    /// separated, with or without a leading dot: `--ext trace,html`. Use this for
+    /// bundles whose reports and traces would otherwise be skipped entirely.
+    #[arg(long = "ext", value_name = "LIST", value_delimiter = ',')]
+    extra_extensions: Vec<String>,
+
+    /// Only anonymize these extensions, ignoring the built-in set. Same format as
+    /// --ext. Takes precedence over --ext when both are given.
+    #[arg(long = "only-ext", value_name = "LIST", value_delimiter = ',')]
+    only_extensions: Vec<String>,
+
+    /// Also anonymize the contents of `.zip` archives found *inside* the input
+    /// directory (VB365 bundles nest rotated logs this way). Entries are extracted,
+    /// anonymized and written to the output as `<archive-name>/<entry>`.
+    #[arg(long = "expand-archives")]
+    expand_archives: bool,
+
     /// Output directory for anonymized files. Not required for --validate-only
     /// or when --output-zip is used.
     #[arg(
@@ -773,6 +816,43 @@ impl Cli {
             .ok_or_else(|| anyhow::anyhow!("an output directory (-o/--output) is required here"))
     }
 
+    /// Extensions treated as anonymizable text, lowercase and without the dot.
+    ///
+    /// Restricting this to `log` alone silently dropped everything else in a real
+    /// bundle — 127 `.trace` files and the `.html` job report were neither
+    /// anonymized nor copied, so the run reported success on a partial result.
+    fn text_extensions(&self) -> BTreeSet<String> {
+        let normalize = |s: &String| s.trim().trim_start_matches('.').to_ascii_lowercase();
+        if !self.only_extensions.is_empty() {
+            return self
+                .only_extensions
+                .iter()
+                .map(normalize)
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        let mut set: BTreeSet<String> = DEFAULT_TEXT_EXTENSIONS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        set.extend(
+            self.extra_extensions
+                .iter()
+                .map(normalize)
+                .filter(|s| !s.is_empty()),
+        );
+        set
+    }
+
+    /// The active extension set, formatted for messages.
+    fn text_extensions_display(&self) -> String {
+        self.text_extensions()
+            .iter()
+            .map(|e| format!(".{e}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// True when the input is a `.zip` bundle (by extension or PK magic bytes).
     fn input_is_zip(&self) -> bool {
         match (&self.input_directory, &self.input_file) {
@@ -867,6 +947,15 @@ fn is_valid_email(email: &str) -> bool {
     }
 
     true
+}
+
+/// True when a `DOMAIN\user` username capture is really a `\uXXXX` escape tail.
+///
+/// JSON-encoded logs (`.trace`) write `'` as `'`, so `contoso.com's`
+/// looks like domain `com` + user `u0027s` to `RE_DOMAIN_USER`.
+fn is_escape_sequence(username: &str) -> bool {
+    let b = username.as_bytes();
+    b.len() >= 5 && (b[0] == b'u' || b[0] == b'U') && b[1..5].iter().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Validate that a string is a real username worth anonymizing
@@ -1345,6 +1434,15 @@ fn extract_entities(content: &str, cfg: &ExtractConfig) -> ExtractedEntities {
                 .iter()
                 .any(|&ext| domain.eq_ignore_ascii_case(ext))
             {
+                continue;
+            }
+            // Reject JSON/C escape sequences. `.trace` files are JSON-encoded, so
+            // "srv.contoso.com's" (an escaped apostrophe) makes this regex fire
+            // with domain = "com", user = "u0027s". That mapping is junk, it rewrites
+            // ordinary escaped text, and --paranoid then reports the surviving
+            // "com'" as a leak. A real account whose name is u+4 hex digits is
+            // missed instead — the safer direction ("miss rather than corrupt").
+            if is_escape_sequence(username) {
                 continue;
             }
             // Reject Windows path segments: a "word\word" flanked by another
@@ -2249,6 +2347,154 @@ fn compute_output_path(
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Nested archive expansion (--expand-archives)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// A temporary directory removed when dropped, including on the error paths.
+struct StagingDir(PathBuf);
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Default)]
+struct StageStats {
+    archives: usize,
+    entries: usize,
+    linked: usize,
+    copied: usize,
+}
+
+/// Strip a zip entry name down to safe relative components.
+///
+/// Zip entries can carry `..` or absolute paths ("zip slip"); joining those onto an
+/// output root writes outside it. Keep only plain components.
+fn safe_relative(name: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for seg in name.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            continue;
+        }
+        out.push(seg);
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Build one staging root holding both the directory's own text files and the text
+/// entries of every nested `.zip`, so the ordinary directory pipeline covers both.
+///
+/// Plain files are hard-linked (no second copy of a multi-GB bundle); expanded zip
+/// entries land under `<archive name without .zip>/<entry>`. Nothing in the input is
+/// modified.
+fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
+    use std::io::Read;
+
+    let root = std::env::temp_dir().join(format!("vlar-expand-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root)
+        .with_context(|| format!("Failed to create staging dir: {}", root.display()))?;
+    let staging = StagingDir(root.clone());
+    let mut stats = StageStats::default();
+
+    let place = |dest: &Path| -> Result<()> {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Ok(())
+    };
+
+    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let rel = match path.strip_prefix(dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        if active_text_extensions().contains(&ext) {
+            let dest = root.join(rel);
+            place(&dest)?;
+            // Hard-link so a large bundle is not duplicated; copy across volumes.
+            match fs::hard_link(path, &dest) {
+                Ok(()) => stats.linked += 1,
+                Err(_) => {
+                    fs::copy(path, &dest)?;
+                    stats.copied += 1;
+                }
+            }
+        } else if ext == "zip" {
+            let file = match fs::File::open(path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let mut archive = match zip::ZipArchive::new(file) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("  ⚠ Skipping unreadable archive ({e})");
+                    continue;
+                }
+            };
+            // Expand beside the archive, under a folder named after it. The common
+            // VB365 shape is one rotated log per archive (`X.log.zip` holding `X.log`),
+            // where a folder would add a pointless `X.log/X.log` level — so a
+            // single-entry archive is flattened to sit where the archive sat.
+            let file_entries = (0..archive.len())
+                .filter(|&i| archive.by_index(i).map(|m| m.is_file()).unwrap_or(false))
+                .count();
+            let base = if file_entries == 1 {
+                rel.parent()
+                    .map(|p| root.join(p))
+                    .unwrap_or_else(|| root.clone())
+            } else {
+                root.join(rel.with_extension(""))
+            };
+            stats.archives += 1;
+
+            for i in 0..archive.len() {
+                let mut member = archive.by_index(i)?;
+                if !member.is_file() {
+                    continue;
+                }
+                let name = member.name().to_string();
+                if !entry_is_text(&name) {
+                    continue;
+                }
+                let Some(safe) = safe_relative(&name) else {
+                    continue;
+                };
+                // A flattened entry can collide with a live file of the same name
+                // (`X.log` plus a rotated `X.log.zip` holding `X.log`). Keep both by
+                // falling back to the per-archive folder.
+                let mut dest = base.join(&safe);
+                if dest.exists() {
+                    dest = root.join(rel.with_extension("")).join(&safe);
+                }
+                place(&dest)?;
+                let mut bytes = Vec::with_capacity(member.size() as usize);
+                member.read_to_end(&mut bytes)?;
+                fs::write(&dest, &bytes)?;
+                stats.entries += 1;
+            }
+        }
+    }
+
+    Ok((staging, stats))
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Input file collection
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2262,20 +2508,60 @@ fn collect_input_files(cli: &Cli) -> Result<Vec<PathBuf>> {
         if !dir.is_dir() {
             anyhow::bail!("Input directory does not exist: {}", dir.display());
         }
-        let files: Vec<PathBuf> = WalkDir::new(dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map(|ext| ext == "log")
-                    .unwrap_or(false)
-            })
-            .map(|e| e.into_path())
-            .collect();
+        let wanted = cli.text_extensions();
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+        let mut archives = 0usize;
+
+        for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let ext = entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            if wanted.contains(ext.as_str()) {
+                files.push(entry.into_path());
+            } else if ext == "zip" {
+                archives += 1;
+            } else {
+                let label = if ext.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    format!(".{ext}")
+                };
+                *skipped.entry(label).or_insert(0) += 1;
+            }
+        }
+
+        // A file that is neither anonymized nor copied is invisible in the stats, so a
+        // partial run looks complete. Always say what was left behind.
+        if !skipped.is_empty() {
+            let detail: Vec<String> = skipped.iter().map(|(e, n)| format!("{n} {e}")).collect();
+            eprintln!(
+                "  ⚠ Skipped {} file(s) with unhandled extensions: {}",
+                skipped.values().sum::<usize>(),
+                detail.join(", ")
+            );
+            eprintln!("    Not anonymized and not copied. Add text types with --ext (e.g. --ext trace,html).");
+        }
+        if archives > 0 {
+            eprintln!("  ⚠ Skipped {archives} .zip archive(s) found inside the directory.");
+            eprintln!(
+                "    Their contents are NOT anonymized. Use --expand-archives to include them."
+            );
+        }
 
         if files.is_empty() {
-            anyhow::bail!("No .log files found in: {}", dir.display());
+            anyhow::bail!(
+                "No files matching extensions [{}] found in: {}",
+                cli.text_extensions_display(),
+                dir.display()
+            );
         }
         Ok(files)
     } else {
@@ -2820,8 +3106,40 @@ fn main() {
 }
 
 fn run() -> Result<i32> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let start = Instant::now();
+
+    // Publish the extension set before any scanning: the zip entry gate reads it
+    // through a global, and an unset global would silently fall back to defaults.
+    let _ = TEXT_EXTENSIONS.set(cli.text_extensions());
+
+    // Nested archives: stage the directory's text files and the archives' text
+    // entries under one root, then point the pipeline at it. Held in scope so the
+    // staging tree outlives the run and is removed on every exit path.
+    let _staging = if cli.expand_archives && !cli.input_is_zip() {
+        match cli.input_directory.clone() {
+            Some(dir) if dir.is_dir() => {
+                let (staged, stats) = stage_with_archives(&dir)?;
+                eprintln!(
+                    "  Expanded {} archive(s): {} text entr(ies) staged, {} file(s) linked{}",
+                    stats.archives,
+                    stats.entries,
+                    stats.linked,
+                    if stats.copied > 0 {
+                        format!(", {} copied", stats.copied)
+                    } else {
+                        String::new()
+                    }
+                );
+                cli.input_directory = Some(staged.0.clone());
+                Some(staged)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let cli = cli;
 
     // In --validate-only the JSON report owns stdout, so all human chatter goes
     // to stderr (keeps `vlar … --validate-only | jq` clean).
@@ -3293,12 +3611,20 @@ fn path_is_zip(p: &Path) -> bool {
     false
 }
 
-/// Whether a zip entry name denotes a `.log` file (content gets anonymized).
-fn entry_is_log(name: &str) -> bool {
-    std::path::Path::new(name)
+/// Whether a zip entry holds anonymizable text.
+///
+/// This gate used to accept only `.log`, which made every other text entry — most
+/// importantly `.trace` files and the `.html` job report — fall through to a
+/// byte-for-byte copy in `transform_entry`, i.e. real customer data was written
+/// into the anonymized output. It now honours the active extension set.
+fn entry_is_text(name: &str) -> bool {
+    match std::path::Path::new(name)
         .extension()
-        .map(|e| e.eq_ignore_ascii_case("log"))
-        .unwrap_or(false)
+        .and_then(|e| e.to_str())
+    {
+        Some(ext) => active_text_extensions().contains(&ext.to_ascii_lowercase()),
+        None => false,
+    }
 }
 
 /// Anonymize a zip entry path (forward-slash separated) component-by-component.
@@ -3334,7 +3660,7 @@ fn scan_zip_units(zip_path: &Path, cfg: &ExtractConfig) -> Result<Vec<ScannedUni
             continue;
         }
         let name = entry.name().to_string();
-        let content = if entry_is_log(&name) {
+        let content = if entry_is_text(&name) {
             let mut bytes = Vec::with_capacity(entry.size() as usize);
             entry.read_to_end(&mut bytes)?;
             decode_bytes(&bytes)
@@ -3426,7 +3752,7 @@ fn transform_entry(
     map: &AnonymizationMap,
     exclude: &ExcludeFilter,
 ) -> Vec<u8> {
-    if entry_is_log(name) {
+    if entry_is_text(name) {
         let content = decode_bytes(&bytes);
         apply_replacements(&content, map, exclude).into_bytes()
     } else {

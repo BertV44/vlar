@@ -1794,3 +1794,209 @@ fn paranoid_no_false_positive_on_windows_path_segments() {
         stderr
     );
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Non-.log text files: extension set, --ext, and nested archives
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// A `.trace` entry inside a zip used to be copied byte-for-byte into the
+/// "anonymized" zip, so real customer data shipped in the file sent to support.
+#[test]
+fn zip_non_log_text_entry_is_anonymized_not_copied() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("bundle.zip");
+    let out_zip = dir.path().join("anon.zip");
+    make_zip(
+        &in_zip,
+        &[
+            ("Svc.log", "log user admin@corp.com at 172.16.0.9\n"),
+            ("Proxy.trace", "trace user erin@corp.com at 172.16.0.10\n"),
+            ("Report.html", "<p>carol@corp.com 172.16.0.11</p>\n"),
+        ],
+    );
+
+    let out = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for (name, content) in read_zip(&out_zip) {
+        assert!(
+            !content.contains("erin@corp.com")
+                && !content.contains("carol@corp.com")
+                && !content.contains("admin@corp.com")
+                && !content.contains("172.16.0."),
+            "entry {name} still holds original data: {content}"
+        );
+    }
+}
+
+/// Directory input must cover the whole bundle, not only `.log`.
+#[test]
+fn directory_covers_default_text_extensions() {
+    let src = TempDir::new().unwrap();
+    let out_dir = TempDir::new().unwrap();
+    fs::write(src.path().join("a.log"), "admin@corp.com 172.16.0.9\n").unwrap();
+    fs::write(src.path().join("b.trace"), "erin@corp.com 172.16.0.10\n").unwrap();
+    fs::write(src.path().join("c.html"), "carol@corp.com 172.16.0.11\n").unwrap();
+
+    let out = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out_dir.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for name in ["a.log", "b.trace", "c.html"] {
+        let p = out_dir.path().join(name);
+        assert!(p.exists(), "{name} missing from output");
+        let content = fs::read_to_string(&p).unwrap();
+        assert!(
+            !content.contains("@corp.com") && !content.contains("172.16.0."),
+            "{name} not anonymized: {content}"
+        );
+    }
+}
+
+/// `--only-ext` narrows the set; everything else is reported as skipped.
+#[test]
+fn only_ext_restricts_and_reports_skipped() {
+    let src = TempDir::new().unwrap();
+    let out_dir = TempDir::new().unwrap();
+    fs::write(src.path().join("a.log"), "admin@corp.com\n").unwrap();
+    fs::write(src.path().join("b.trace"), "erin@corp.com\n").unwrap();
+
+    let out = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out_dir.path().to_str().unwrap(),
+        "--only-ext",
+        "log",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(out.status.success());
+    assert!(out_dir.path().join("a.log").exists());
+    assert!(!out_dir.path().join("b.trace").exists());
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Skipped 1 file(s)") && stderr.contains(".trace"),
+        "skipped files must be reported, not silently dropped. stderr: {stderr}"
+    );
+}
+
+/// A directory containing a `.zip` warns by default and expands with the flag.
+#[test]
+fn expand_archives_anonymizes_nested_zip_entries() {
+    let src = TempDir::new().unwrap();
+    let out_dir = TempDir::new().unwrap();
+    fs::write(src.path().join("live.log"), "admin@corp.com 172.16.0.9\n").unwrap();
+    make_zip(
+        &src.path().join("rotated.zip"),
+        &[
+            ("Old.log", "dave@corp.com 172.16.0.16\n"),
+            ("Old.trace", "erin@corp.com 172.16.0.17\n"),
+        ],
+    );
+
+    // Default: warns, does not touch the archive.
+    let out = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out_dir.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Skipped 1 .zip archive"),
+        "nested archive must be reported. stderr: {stderr}"
+    );
+
+    // With the flag: entries land under <archive-name>/ and are anonymized.
+    let out_dir2 = TempDir::new().unwrap();
+    let out = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out_dir2.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for rel in ["live.log", "rotated/Old.log", "rotated/Old.trace"] {
+        let p = out_dir2.path().join(rel);
+        assert!(p.exists(), "{rel} missing from expanded output");
+        let content = fs::read_to_string(&p).unwrap();
+        assert!(
+            !content.contains("@corp.com") && !content.contains("172.16.0."),
+            "{rel} not anonymized: {content}"
+        );
+    }
+}
+
+/// JSON-encoded logs write `'` as `'`, which made `RE_DOMAIN_USER` fire with
+/// domain "com" / user "u0027s" and left --paranoid reporting a phantom leak.
+#[test]
+fn json_escape_is_not_a_domain_user() {
+    let src = TempDir::new().unwrap();
+    let out_dir = TempDir::new().unwrap();
+    fs::write(
+        src.path().join("a.trace"),
+        "{\"m\":\"box alice@corp.com\\u0027s folder on srv.corp.com\\u0027\"}\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out_dir.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--paranoid",
+    ]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Leak detected"),
+        "escaped apostrophe must not be reported as a leak. stderr: {stderr}"
+    );
+
+    let content = fs::read_to_string(out_dir.path().join("a.trace")).unwrap();
+    // The domain is anonymized; the escape survives as ordinary text.
+    assert!(
+        !content.contains("corp.com"),
+        "domain not anonymized: {content}"
+    );
+    assert!(
+        content.contains("\\u0027"),
+        "escape sequence was corrupted: {content}"
+    );
+}
