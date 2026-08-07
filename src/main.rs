@@ -680,7 +680,9 @@ struct Cli {
 
     /// Also anonymize the contents of `.zip` archives found *inside* the input
     /// directory (VB365 bundles nest rotated logs this way). Entries are extracted,
-    /// anonymized and written to the output as `<archive-name>/<entry>`.
+    /// anonymized and written to the output as `<archive-name>.extracted/<entry>`,
+    /// beside the archive — a distinct directory per archive, so an expanded entry
+    /// can never overwrite a live file or another archive's entry.
     #[arg(long = "expand-archives")]
     expand_archives: bool,
 
@@ -952,10 +954,50 @@ fn is_valid_email(email: &str) -> bool {
 /// True when a `DOMAIN\user` username capture is really a `\uXXXX` escape tail.
 ///
 /// JSON-encoded logs (`.trace`) write `'` as `'`, so `contoso.com's`
-/// looks like domain `com` + user `u0027s` to `RE_DOMAIN_USER`.
+/// looks like domain `com` + user `u0027s` to `RE_DOMAIN_USER`. Checked for every
+/// content kind: a `\uXXXX` escape is just as spurious in a plain `.log`.
 fn is_escape_sequence(username: &str) -> bool {
     let b = username.as_bytes();
     b.len() >= 5 && (b[0] == b'u' || b[0] == b'U') && b[1..5].iter().all(|c| c.is_ascii_hexdigit())
+}
+
+/// How a file's text spells a literal backslash — decides whether a lone `\` in
+/// `word\word` is a `DOMAIN\user` separator or the start of an escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentKind {
+    /// Plain text (`.log`, `.txt`, …): a single backslash is a real separator.
+    Plain,
+    /// JSON-encoded (`.trace`, `.json`): a literal backslash is written `\\`, so
+    /// every *single* backslash introduces an escape.
+    JsonEscaped,
+}
+
+impl ContentKind {
+    /// Derived from the file/entry name. `.trace` is the Veeam proxy trace format,
+    /// which is JSON per line.
+    fn for_name(name: &str) -> Self {
+        match Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+        {
+            Some(ext) if ext == "trace" || ext == "json" => ContentKind::JsonEscaped,
+            _ => ContentKind::Plain,
+        }
+    }
+}
+
+/// True when a `DOMAIN\user` username capture in JSON text is an escape tail.
+///
+/// In valid JSON a lone backslash is always followed by one of `" \ / b f n r t u`,
+/// so `col1\tsep2` is an escaped tab, not domain `col1` + user `tsep2`. Nothing real
+/// is lost by rejecting these: a genuine `DOMAIN\user` is written `DOMAIN\\user` in
+/// JSON, which `RE_DOMAIN_USER` (one literal backslash) never matches anyway.
+fn starts_with_json_escape(username: &str) -> bool {
+    matches!(
+        username.as_bytes().first(),
+        Some(b'b' | b'f' | b'n' | b'r' | b't' | b'u')
+    )
 }
 
 /// Validate that a string is a real username worth anonymizing
@@ -1402,8 +1444,17 @@ struct ExtractConfig {
     db_list: HashSet<String>,
 }
 
-/// Extract all entities from file content (v2.3 extended).
+/// Extract all entities from plain text content (v2.3 extended).
 fn extract_entities(content: &str, cfg: &ExtractConfig) -> ExtractedEntities {
+    extract_entities_of_kind(content, cfg, ContentKind::Plain)
+}
+
+/// Extract all entities, told how the content spells backslashes.
+fn extract_entities_of_kind(
+    content: &str,
+    cfg: &ExtractConfig,
+    kind: ContentKind,
+) -> ExtractedEntities {
     let mut out = ExtractedEntities::default();
 
     // Extract emails
@@ -1443,6 +1494,14 @@ fn extract_entities(content: &str, cfg: &ExtractConfig) -> ExtractedEntities {
             // "com'" as a leak. A real account whose name is u+4 hex digits is
             // missed instead — the safer direction ("miss rather than corrupt").
             if is_escape_sequence(username) {
+                continue;
+            }
+            // In JSON-encoded content the escape family is wider: `\t`, `\n`, `\f`,
+            // `\r`, `\b` produce the same junk ("col1\tsep2" -> domain col1 / user
+            // tsep2) and corrupt the escape on write, turning valid JSON into
+            // invalid. Rejecting them loses nothing real — see
+            // `starts_with_json_escape`.
+            if kind == ContentKind::JsonEscaped && starts_with_json_escape(username) {
                 continue;
             }
             // Reject Windows path segments: a "word\word" flanked by another
@@ -1599,7 +1658,9 @@ fn extract_entities(content: &str, cfg: &ExtractConfig) -> ExtractedEntities {
 /// hostnames remain non-auto-detectable by design (use --hostname-list /
 /// --object-list). Shared by the filesystem scan and the `.zip` scan.
 fn extract_entities_with_path(content: &str, rel: &str, cfg: &ExtractConfig) -> ExtractedEntities {
-    let mut entities = extract_entities(content, cfg);
+    // The content's own escaping convention follows its extension; the path text
+    // itself is always plain (a `\` in a path is a real separator).
+    let mut entities = extract_entities_of_kind(content, cfg, ContentKind::for_name(rel));
     if !rel.is_empty() {
         entities.merge(extract_entities(rel, cfg));
         // Also scan with the trailing file extension stripped: a FQDN at the end
@@ -2386,28 +2447,75 @@ fn safe_relative(name: &str) -> Option<PathBuf> {
     }
 }
 
+/// Suffix for the directory an archive is expanded into, appended to the archive's
+/// own file name: `Svc.log.zip` -> `Svc.log.zip.extracted/`.
+///
+/// Keeping the full archive name (extension included) and adding a suffix is what
+/// makes the staged layout collision-free: archive paths are unique within the
+/// input, so two archives can never target the same directory, and the suffix keeps
+/// that directory from colliding with a live file — `Svc.log` and
+/// `Svc.log.zip.extracted/` can coexist. Deriving the directory from the archive
+/// *stem* instead (`Svc.log.zip` -> `Svc.log/`) collides with a live `Svc.log`,
+/// which is a file where a directory is needed.
+const EXPANDED_DIR_SUFFIX: &str = ".extracted";
+
+/// Create a fresh, uniquely named staging root under the temp directory.
+///
+/// The name carries a random component: a bare PID is predictable (symlink
+/// pre-creation on a shared `/tmp`) and not unique either, since PIDs are reused and
+/// two containers can share one. `create_dir` (not `create_dir_all`) fails rather
+/// than adopting a path that already exists.
+fn create_staging_root() -> Result<PathBuf> {
+    let base = std::env::temp_dir();
+    for _ in 0..8 {
+        let root = base.join(format!(
+            "vlar-expand-{}-{}",
+            std::process::id(),
+            generate_random_string(10)
+        ));
+        match fs::create_dir(&root) {
+            Ok(()) => return Ok(root),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to create staging dir: {}", root.display()))
+            }
+        }
+    }
+    anyhow::bail!(
+        "Failed to create a unique staging directory under {}",
+        base.display()
+    )
+}
+
+/// Create `dest`'s parent directories and return a handle to `dest`, refusing to
+/// touch a path that already exists.
+///
+/// Staging must never resolve a collision by overwriting: `fs::copy` onto an
+/// occupied path truncates it silently, which is how an expanded archive entry can
+/// disappear while still being counted as staged.
+fn create_new_file(dest: &Path) -> Result<fs::File> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create staging dir: {}", parent.display()))?;
+    }
+    fs::File::create_new(dest)
+        .with_context(|| format!("Staging path already taken: {}", dest.display()))
+}
+
 /// Build one staging root holding both the directory's own text files and the text
 /// entries of every nested `.zip`, so the ordinary directory pipeline covers both.
 ///
-/// Plain files are hard-linked (no second copy of a multi-GB bundle); expanded zip
-/// entries land under `<archive name without .zip>/<entry>`. Nothing in the input is
-/// modified.
+/// Plain files are hard-linked where possible (no second copy of a multi-GB bundle)
+/// and copied otherwise — hard links cannot cross filesystems, so an input on a
+/// different volume than the temp directory is duplicated. Expanded entries land in
+/// `<archive name>.extracted/<entry>` beside the archive. Nothing in the input is
+/// modified: the staged tree is read-only as far as this program is concerned, and
+/// hard links share an inode with the original.
 fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
-    use std::io::Read;
-
-    let root = std::env::temp_dir().join(format!("vlar-expand-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root)
-        .with_context(|| format!("Failed to create staging dir: {}", root.display()))?;
+    let root = create_staging_root()?;
     let staging = StagingDir(root.clone());
     let mut stats = StageStats::default();
-
-    let place = |dest: &Path| -> Result<()> {
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        Ok(())
-    };
 
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
@@ -2426,45 +2534,63 @@ fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
 
         if active_text_extensions().contains(&ext) {
             let dest = root.join(rel);
-            place(&dest)?;
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create staging dir: {}", parent.display())
+                })?;
+            }
             // Hard-link so a large bundle is not duplicated; copy across volumes.
             match fs::hard_link(path, &dest) {
                 Ok(()) => stats.linked += 1,
                 Err(_) => {
-                    fs::copy(path, &dest)?;
+                    // Only fall back for a genuinely absent destination — copying
+                    // onto an existing staged file would silently truncate it.
+                    if dest.exists() {
+                        anyhow::bail!("Staging path already taken: {}", dest.display());
+                    }
+                    fs::copy(path, &dest).with_context(|| {
+                        format!("Failed to stage {} -> {}", path.display(), dest.display())
+                    })?;
                     stats.copied += 1;
                 }
             }
         } else if ext == "zip" {
             let file = match fs::File::open(path) {
                 Ok(f) => f,
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("  ⚠ Skipping unreadable archive {}: {e}", rel.display());
+                    continue;
+                }
             };
             let mut archive = match zip::ZipArchive::new(file) {
                 Ok(a) => a,
                 Err(e) => {
-                    eprintln!("  ⚠ Skipping unreadable archive ({e})");
+                    eprintln!("  ⚠ Skipping unreadable archive {}: {e}", rel.display());
                     continue;
                 }
             };
-            // Expand beside the archive, under a folder named after it. The common
-            // VB365 shape is one rotated log per archive (`X.log.zip` holding `X.log`),
-            // where a folder would add a pointless `X.log/X.log` level — so a
-            // single-entry archive is flattened to sit where the archive sat.
-            let file_entries = (0..archive.len())
-                .filter(|&i| archive.by_index(i).map(|m| m.is_file()).unwrap_or(false))
-                .count();
-            let base = if file_entries == 1 {
-                rel.parent()
-                    .map(|p| root.join(p))
-                    .unwrap_or_else(|| root.clone())
-            } else {
-                root.join(rel.with_extension(""))
+            // One directory per archive, named after the archive itself. Unique by
+            // construction, so no entry can land on another archive's entry or on a
+            // live file — see EXPANDED_DIR_SUFFIX.
+            let mut base_name = rel.file_name().unwrap_or_default().to_os_string();
+            base_name.push(EXPANDED_DIR_SUFFIX);
+            let base = match rel.parent() {
+                Some(p) => root.join(p).join(&base_name),
+                None => root.join(&base_name),
             };
             stats.archives += 1;
 
             for i in 0..archive.len() {
-                let mut member = archive.by_index(i)?;
+                // A damaged entry skips that entry only. Aborting the whole run for
+                // one bad member would throw away the other 100+ archives of a
+                // bundle after minutes of work.
+                let mut member = match archive.by_index(i) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("  ⚠ Skipping unreadable entry in {}: {e}", rel.display());
+                        continue;
+                    }
+                };
                 if !member.is_file() {
                     continue;
                 }
@@ -2475,23 +2601,105 @@ fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
                 let Some(safe) = safe_relative(&name) else {
                     continue;
                 };
-                // A flattened entry can collide with a live file of the same name
-                // (`X.log` plus a rotated `X.log.zip` holding `X.log`). Keep both by
-                // falling back to the per-archive folder.
-                let mut dest = base.join(&safe);
-                if dest.exists() {
-                    dest = root.join(rel.with_extension("")).join(&safe);
+                let dest = base.join(&safe);
+                let mut out = create_new_file(&dest)?;
+                // Stream: the entry's declared size comes from the archive and is not
+                // to be trusted as an allocation hint.
+                match std::io::copy(&mut member, &mut out) {
+                    Ok(_) => stats.entries += 1,
+                    Err(e) => {
+                        eprintln!("  ⚠ Failed to expand {name} from {}: {e}", rel.display());
+                        drop(out);
+                        let _ = fs::remove_file(&dest);
+                    }
                 }
-                place(&dest)?;
-                let mut bytes = Vec::with_capacity(member.size() as usize);
-                member.read_to_end(&mut bytes)?;
-                fs::write(&dest, &bytes)?;
-                stats.entries += 1;
             }
         }
     }
 
     Ok((staging, stats))
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Coverage reporting (shared by directory and .zip input)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// What happens to a file whose extension is outside the active set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnhandledFate {
+    /// Directory input: neither anonymized nor written to the output.
+    Dropped,
+    /// `.zip` input: copied byte-for-byte into the output archive. This is the
+    /// dangerous one — an untouched text entry ships real customer data inside the
+    /// file that gets sent to support — so it has to be said out loud.
+    CopiedVerbatim,
+}
+
+/// Report files/entries left outside the active extension set, grouped by extension.
+///
+/// Both input modes call this. When only the directory walk reported, a `.zip` run
+/// could copy a `.reg` or an extensionless text file straight through in silence,
+/// which is the failure this tool exists to prevent.
+fn report_unhandled_extensions(skipped: &BTreeMap<String, usize>, fate: UnhandledFate) {
+    if skipped.is_empty() {
+        return;
+    }
+    let detail: Vec<String> = skipped.iter().map(|(e, n)| format!("{n} {e}")).collect();
+    let total: usize = skipped.values().sum();
+    match fate {
+        UnhandledFate::Dropped => {
+            eprintln!(
+                "  ⚠ Skipped {total} file(s) with unhandled extensions: {}",
+                detail.join(", ")
+            );
+            eprintln!(
+                "    Not anonymized and not copied. Add text types with --ext (e.g. --ext trace,html)."
+            );
+        }
+        UnhandledFate::CopiedVerbatim => {
+            eprintln!(
+                "  ⚠ {total} zip entr(ies) with unhandled extensions: {}",
+                detail.join(", ")
+            );
+            eprintln!("    These are copied into the output UNCHANGED — any customer data they");
+            eprintln!(
+                "    contain is NOT anonymized. Add text types with --ext (e.g. --ext reg,ini)."
+            );
+        }
+    }
+}
+
+/// Tally the zip entries that fall outside the active extension set, by extension.
+///
+/// Reads the central directory only — no entry is decompressed.
+fn tally_zip_unhandled(zip_path: &Path) -> Result<BTreeMap<String, usize>> {
+    let file = fs::File::open(zip_path)
+        .with_context(|| format!("Failed to open zip: {}", zip_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("Failed to read zip: {}", zip_path.display()))?;
+    let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+    for i in 0..archive.len() {
+        let Ok(entry) = archive.by_index(i) else {
+            continue;
+        };
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        if entry_is_text(&name) {
+            continue;
+        }
+        let label = match Path::new(&name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+        {
+            Some(ext) => format!(".{ext}"),
+            None => "(none)".to_string(),
+        };
+        *skipped.entry(label).or_insert(0) += 1;
+    }
+    Ok(skipped)
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2540,15 +2748,7 @@ fn collect_input_files(cli: &Cli) -> Result<Vec<PathBuf>> {
 
         // A file that is neither anonymized nor copied is invisible in the stats, so a
         // partial run looks complete. Always say what was left behind.
-        if !skipped.is_empty() {
-            let detail: Vec<String> = skipped.iter().map(|(e, n)| format!("{n} {e}")).collect();
-            eprintln!(
-                "  ⚠ Skipped {} file(s) with unhandled extensions: {}",
-                skipped.values().sum::<usize>(),
-                detail.join(", ")
-            );
-            eprintln!("    Not anonymized and not copied. Add text types with --ext (e.g. --ext trace,html).");
-        }
+        report_unhandled_extensions(&skipped, UnhandledFate::Dropped);
         if archives > 0 {
             eprintln!("  ⚠ Skipped {archives} .zip archive(s) found inside the directory.");
             eprintln!(
@@ -3116,6 +3316,15 @@ fn run() -> Result<i32> {
     // Nested archives: stage the directory's text files and the archives' text
     // entries under one root, then point the pipeline at it. Held in scope so the
     // staging tree outlives the run and is removed on every exit path.
+    if cli.expand_archives && cli.input_is_zip() {
+        eprintln!("  ⚠ --expand-archives has no effect on a .zip input (it expands archives");
+        eprintln!("    found inside a -d directory). Entries of THIS zip are handled directly.");
+    }
+    if cli.expand_archives && cli.input_file.is_some() {
+        eprintln!("  ⚠ --expand-archives has no effect with -i/--input (single file); it applies");
+        eprintln!("    to -d/--directory input only.");
+    }
+
     let _staging = if cli.expand_archives && !cli.input_is_zip() {
         match cli.input_directory.clone() {
             Some(dir) if dir.is_dir() => {
@@ -3692,6 +3901,13 @@ fn scan_zip_entities(zip_path: &Path, cfg: &ExtractConfig) -> Result<(ExtractedE
 fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i32> {
     let zip_path = zip_input_path(cli).to_path_buf();
 
+    // Say what will be copied through untouched, before doing it — same reporting
+    // the directory walk gives, so the two input modes agree on coverage.
+    report_unhandled_extensions(
+        &tally_zip_unhandled(&zip_path)?,
+        UnhandledFate::CopiedVerbatim,
+    );
+
     // Phase 1: scan
     let (raw, file_count) = scan_zip_entities(&zip_path, cfg)?;
     let map = build_map(raw, exclude, cfg);
@@ -4095,6 +4311,70 @@ mod tests {
             "Windows path segment must NOT be a domain user, got: {:?}",
             domain_users
         );
+    }
+
+    /// `.trace` is JSON per line: a lone backslash is an escape, never a
+    /// `DOMAIN\user` separator (a real one would be written `DOMAIN\\user`).
+    #[test]
+    fn json_content_rejects_single_char_escapes_as_domain_users() {
+        let content = "{\"m\":\"col1\\tsep2 line\\nend2 page\\fmore ret\\rx bs\\bx\"}";
+        let cfg = ExtractConfig {
+            aggressive: true,
+            user_list: HashSet::new(),
+            hostname_list: HashSet::new(),
+            object_list: HashSet::new(),
+            db_list: HashSet::new(),
+        };
+
+        let json = extract_entities_of_kind(content, &cfg, ContentKind::JsonEscaped);
+        assert!(
+            json.domain_users.is_empty(),
+            "JSON escapes must not become domain users, got: {:?}",
+            json.domain_users
+        );
+
+        // The very same bytes in a plain .log are genuine separators, so the
+        // rule must not leak across content kinds.
+        let plain = extract_entities_of_kind(content, &cfg, ContentKind::Plain);
+        assert!(
+            !plain.domain_users.is_empty(),
+            "plain-text detection must be unaffected"
+        );
+    }
+
+    /// The JSON rule is selected by extension, not guessed from content.
+    #[test]
+    fn content_kind_follows_extension() {
+        for name in ["Proxy.trace", "dump.JSON", "a/b/c.trace"] {
+            assert_eq!(
+                ContentKind::for_name(name),
+                ContentKind::JsonEscaped,
+                "{name} should be treated as JSON-escaped"
+            );
+        }
+        for name in ["Svc.log", "report.html", "notes.txt", "noext"] {
+            assert_eq!(
+                ContentKind::for_name(name),
+                ContentKind::Plain,
+                "{name} should be treated as plain text"
+            );
+        }
+    }
+
+    /// A real `DOMAIN\user` in a plain log whose name starts with an escape letter
+    /// must still be detected — the JSON rule is scoped to JSON content only.
+    #[test]
+    fn plain_log_username_starting_with_escape_letter_is_detected() {
+        for user in ["tanya", "bob", "nina", "frank", "rita"] {
+            let content = format!("logon by CORP\\{user} ok");
+            let (_, domain_users, _, _) = extract_legacy(&content);
+            assert!(
+                domain_users
+                    .iter()
+                    .any(|u| u.to_lowercase() == format!("corp\\{user}")),
+                "CORP\\{user} must be detected in plain text, got: {domain_users:?}"
+            );
+        }
     }
 
     #[test]

@@ -1950,7 +1950,11 @@ fn expand_archives_anonymizes_nested_zip_entries() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    for rel in ["live.log", "rotated/Old.log", "rotated/Old.trace"] {
+    for rel in [
+        "live.log",
+        "rotated.zip.extracted/Old.log",
+        "rotated.zip.extracted/Old.trace",
+    ] {
         let p = out_dir2.path().join(rel);
         assert!(p.exists(), "{rel} missing from expanded output");
         let content = fs::read_to_string(&p).unwrap();
@@ -1959,6 +1963,248 @@ fn expand_archives_anonymizes_nested_zip_entries() {
             "{rel} not anonymized: {content}"
         );
     }
+}
+
+/// A single-entry archive whose entry has the same name as a live file next to it
+/// used to be staged onto that live file. Whichever `WalkDir` reached second won:
+/// the archive entry was written first, then the live file's `hard_link` failed with
+/// EEXIST and the `fs::copy` fallback truncated the extracted content. The rotated
+/// log vanished while the run reported "1 text entr(ies) staged" and exited 0.
+#[test]
+fn expand_archives_keeps_both_on_name_collision() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(src.path().join("Svc.log"), "LIVE alice@corp.com 10.1.1.1\n").unwrap();
+    make_zip(
+        &src.path().join("Svc.log.zip"),
+        &[("Svc.log", "ROTATED bob@corp.com 10.2.2.2\n")],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // Both records must reach the output, in distinct files.
+    let mut live = false;
+    let mut rotated = false;
+    for e in collect_files(out.path()) {
+        let c = fs::read_to_string(&e).unwrap_or_default();
+        live |= c.contains("LIVE");
+        rotated |= c.contains("ROTATED");
+    }
+    assert!(live, "live Svc.log content missing from output");
+    assert!(
+        rotated,
+        "rotated Svc.log content was silently dropped — the collision overwrote it"
+    );
+}
+
+/// The same collision with a multi-entry archive used to abort the whole run with a
+/// bare `Is a directory (os error 21)`, because the archive's expansion directory and
+/// the live file wanted the same path.
+#[test]
+fn expand_archives_multi_entry_collision_does_not_abort() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(src.path().join("Svc.log"), "LIVE alice@corp.com\n").unwrap();
+    make_zip(
+        &src.path().join("Svc.log.zip"),
+        &[
+            ("a.log", "R1 bob@corp.com\n"),
+            ("b.log", "R2 carol@corp.com\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "run aborted on a name collision. stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let bodies: Vec<String> = collect_files(out.path())
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap_or_default())
+        .collect();
+    for marker in ["LIVE", "R1", "R2"] {
+        assert!(
+            bodies.iter().any(|c| c.contains(marker)),
+            "{marker} missing from output; got {bodies:?}"
+        );
+    }
+}
+
+/// Two archives in the same directory holding an identically named entry must both
+/// survive — each archive gets its own expansion directory.
+#[test]
+fn expand_archives_two_archives_same_entry_name() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    make_zip(
+        &src.path().join("r1.zip"),
+        &[("App.log", "FIRST bob@corp.com\n")],
+    );
+    make_zip(
+        &src.path().join("r2.zip"),
+        &[("App.log", "SECOND carol@corp.com\n")],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let bodies: Vec<String> = collect_files(out.path())
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap_or_default())
+        .collect();
+    for marker in ["FIRST", "SECOND"] {
+        assert!(
+            bodies.iter().any(|c| c.contains(marker)),
+            "{marker} missing — one archive overwrote the other; got {bodies:?}"
+        );
+    }
+}
+
+/// Zip input copies entries outside the extension set through byte-for-byte. That is
+/// a deliberate design choice, but it has to be reported: the directory walk warned
+/// while the zip path stayed silent, and the zip is what gets sent to support.
+#[test]
+fn zip_unhandled_entries_are_reported() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("bundle.zip");
+    let out_zip = dir.path().join("anon.zip");
+    make_zip(
+        &in_zip,
+        &[
+            ("Svc.log", "log admin@corp.com\n"),
+            ("export.reg", "host=vbr01.corp.com user=CORP\\svc_v\n"),
+            ("README", "plain dave@corp.com\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains(".reg") && stderr.contains("(none)"),
+        "unhandled zip entries must be listed by extension. stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("UNCHANGED"),
+        "the report must say these entries are not anonymized. stderr: {stderr}"
+    );
+}
+
+/// The JSON escape false positive is not specific to `'`: `\t`, `\n`, `\f`, `\r`
+/// and `\b` made RE_DOMAIN_USER fire the same way ("col1\tsep2" -> domain col1 / user
+/// tsep2), producing junk mappings that rewrote ordinary text and turned valid JSON
+/// escapes into invalid ones.
+#[test]
+fn json_single_char_escapes_are_not_domain_users() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let line = "{\"m\":\"col1\\tsep2 line\\nend2 page\\fmore ret\\rx bs\\bx on srv.corp.com\"}\n";
+    fs::write(src.path().join("p.trace"), line).unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--paranoid",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let got = fs::read_to_string(out.path().join("p.trace")).unwrap();
+    // Every escape must survive byte-for-byte...
+    for esc in ["\\t", "\\n", "\\f", "\\r", "\\b"] {
+        assert!(
+            got.contains(esc),
+            "escape {esc} was corrupted into a fake DOMAIN\\user: {got}"
+        );
+    }
+    // ...along with the words around them, while the real FQDN is still anonymized.
+    for word in ["col1", "sep2", "line", "end2", "page", "more"] {
+        assert!(
+            got.contains(word),
+            "ordinary word {word} was rewritten: {got}"
+        );
+    }
+    assert!(!got.contains("srv.corp.com"), "FQDN not anonymized: {got}");
+}
+
+/// A plain-text `.log` keeps normal DOMAIN\user detection — the JSON rule must not
+/// leak into content where a single backslash really is a separator.
+#[test]
+fn plain_log_domain_user_still_detected() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(src.path().join("a.log"), "logon by CORP\\tanya failed\n").unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+    assert!(
+        !got.contains("CORP\\tanya"),
+        "plain-text DOMAIN\\user must still be anonymized: {got}"
+    );
 }
 
 /// JSON-encoded logs write `'` as `'`, which made `RE_DOMAIN_USER` fire with
