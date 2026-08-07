@@ -61,6 +61,58 @@ This tool's detection scope follows the categories listed in [KB2462](https://ww
 - **Flexible**: Exclude specific entity types with `--exclude`, opt-in aggressive detection with `--aggressive`
 - **Safe**: Paranoid re-scan mode + collision detection on generated values
 
+## What's new in v2.7
+
+Coverage beyond `.log`, from real VB365 bundle testing.
+
+### Non-`.log` text files are anonymized by default
+
+A Veeam bundle is not only `.log`: proxy traces are `.trace`, job reports are `.html`,
+configuration dumps are `.xml` / `.config`. All carry the same mailboxes, hostnames and paths as
+the logs. Previously only `.log` was handled, with two consequences — in directory mode the rest
+was **silently dropped** (neither anonymized nor copied, so a partial run reported success), and
+in `.zip` mode it was **copied byte-for-byte into the anonymized archive**, i.e. real customer
+data shipped in the file sent to support.
+
+The built-in set is now:
+
+```
+log  trace  txt  xml  html  htm  csv  json  config  err  out
+```
+
+- `--ext trace,html` — add extensions to the set
+- `--only-ext log` — replace the set (restores the pre-v2.7 `.log`-only scope)
+
+**Anything outside the set is now reported**, grouped by extension, in *both* input modes — a
+directory run says what it skipped, and a `.zip` run says what it copied through unchanged. A
+`.reg` export or an extensionless text file will show up there; add it with `--ext` if it matters.
+Coverage is never silently partial.
+
+### `--expand-archives` — nested `.zip` archives
+
+Rotated logs are archived as `.zip` *inside* a bundle, and directory input used to ignore them
+entirely. They are now reported by default, and `--expand-archives` stages their text entries so
+the normal pipeline covers them.
+
+Entries land in `<archive-name>.extracted/<entry>` beside the archive — one directory per
+archive, named after the archive itself, so an expanded entry can never overwrite a live file or
+another archive's entry (a live `Svc.log` and a rotated `Svc.log.zip` holding its own `Svc.log`
+both survive). Staged files are hard-linked where the filesystem allows it, so a multi-GB bundle
+is not duplicated; a temp directory on a different volume than the input falls back to copying.
+The staging tree is removed on every exit path.
+
+### Fewer false positives in JSON-encoded traces
+
+`.trace` files are JSON per line, where a literal backslash is written `\\`. A lone backslash is
+therefore always an escape, but `RE_DOMAIN_USER` read `col1\tsep2` as domain `col1` + user
+`tsep2` — junk mappings that rewrote ordinary text, mangled the escape into invalid JSON, and
+left `--paranoid` reporting phantom leaks. Single-backslash escapes (`\b \f \n \r \t \uXXXX`) are
+no longer treated as `DOMAIN\user` in JSON-encoded content. Plain-text `.log` detection is
+unchanged.
+
+> **Known gap:** a genuine `DOMAIN\user` inside a `.trace` is written `DOMAIN\\user` and is *not*
+> currently detected. Use `--user-list` for service accounts that matter in trace files.
+
 ## What's new in v2.6.1
 
 Fixes from real-world bundle testing:
@@ -269,6 +321,9 @@ veeam-log-anonymizer -d ./logs -o ./output -f -e pem
 |---|---|---|
 | `-i` | `--input FILE` | Input log file |
 | `-d` | `--directory DIR` | Input directory (recursive) or a `.zip` bundle |
+|  | `--ext LIST` | Extra text extensions to anonymize, on top of the built-in set |
+|  | `--only-ext LIST` | Anonymize only these extensions, ignoring the built-in set |
+|  | `--expand-archives` | Also anonymize `.zip` archives nested inside a `-d` directory |
 | `-o` | `--output DIR` | Output directory (required, except with `--validate-only` / `--output-zip`) |
 |  | `--output-zip FILE` | Repack the anonymized result into a new `.zip` (zip input) |
 | `-f` | `--force` | Force overwrite / create directories |
