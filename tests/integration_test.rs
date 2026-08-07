@@ -2246,3 +2246,202 @@ fn json_escape_is_not_a_domain_user() {
         "escape sequence was corrupted: {content}"
     );
 }
+
+/// A genuine account inside a JSON-encoded `.trace` is written `DOMAIN\\user`, which
+/// the single-backslash pattern never matched — the service account shipped in clear
+/// while `--paranoid` reported the file clean (#8). The replacement must keep the
+/// doubled separator, or the anonymized line stops being valid JSON.
+#[test]
+fn escaped_domain_user_in_trace_is_anonymized_and_reversible() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let back = TempDir::new().unwrap();
+    let dict = TempDir::new().unwrap();
+
+    // As stored on disk, all three lines valid JSON:
+    //   1. a real account   -> must be anonymized
+    //   2. a Windows path    -> must be left alone
+    //   3. a \t escape       -> must be left alone
+    let input = concat!(
+        r#"{"m":"quoted \"ACME\\svc_veeam\" logged on"}"#,
+        "\n",
+        r#"{"m":"path C:\\Program\\VeeamBackup\\Backup_Job_1\\run.log"}"#,
+        "\n",
+        r#"{"m":"col1\tsep2 on srv.corp.com"}"#,
+        "\n"
+    );
+    fs::write(src.path().join("p.trace"), input).unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--paranoid",
+        "-D",
+        "--dict-output",
+        dict.path().to_str().unwrap(),
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let got = fs::read_to_string(out.path().join("p.trace")).unwrap();
+    assert!(
+        !got.contains("svc_veeam"),
+        "escaped DOMAIN\\\\user leaked in clear: {got}"
+    );
+    assert!(
+        got.contains(r"\\"),
+        "the doubled separator must survive, or the line is no longer valid JSON: {got}"
+    );
+    // The path and the tab escape are untouched.
+    assert!(
+        got.contains(r"VeeamBackup\\Backup_Job_1"),
+        "JSON-encoded path was rewritten: {got}"
+    );
+    assert!(
+        got.contains(r"col1\tsep2"),
+        "tab escape was rewritten: {got}"
+    );
+
+    // Reversing with the dictionary restores the original bytes exactly.
+    let dict_file = collect_files(dict.path())
+        .into_iter()
+        .find(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+        .expect("dictionary not written");
+    let o = run(&[
+        "--reverse",
+        dict_file.to_str().unwrap(),
+        "-d",
+        out.path().to_str().unwrap(),
+        "-o",
+        back.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(back.path().join("p.trace")).unwrap(),
+        input,
+        "round trip through the dictionary must restore the original bytes"
+    );
+}
+
+/// The same real account reaches the anonymizer in two different byte forms: plain
+/// `ACME\svc_veeam` in a `.log`, JSON-escaped `ACME\\svc_veeam` in a `.trace`. Before
+/// this fix, `build_map()` keyed replacement generation off the raw matched string, so
+/// the two forms got two independent random replacements — a support engineer
+/// correlating a job's `.log` with its `.trace` then saw two accounts where there was
+/// only one, breaking the README's "same entity always gets the same replacement"
+/// promise. This asserts both files anonymize to the *same* domain/user words (only the
+/// separator width differs), and that `-D` + `--reverse` still restores both files
+/// byte-for-byte.
+#[test]
+fn same_account_consistent_across_log_and_trace() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let back = TempDir::new().unwrap();
+    let dict = TempDir::new().unwrap();
+
+    let log_input = "logon ACME\\svc_veeam here\n";
+    // As stored on disk: {"m":"json \"ACME\\svc_veeam\" here"}
+    let trace_input = concat!(r#"{"m":"json \"ACME\\svc_veeam\" here"}"#, "\n");
+    fs::write(src.path().join("a.log"), log_input).unwrap();
+    fs::write(src.path().join("b.trace"), trace_input).unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "-D",
+        "--dict-output",
+        dict.path().to_str().unwrap(),
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let log_out = fs::read_to_string(out.path().join("a.log")).unwrap();
+    let trace_out = fs::read_to_string(out.path().join("b.trace")).unwrap();
+    assert!(
+        !log_out.contains("ACME") && !log_out.contains("svc_veeam"),
+        "account leaked in clear in a.log: {log_out}"
+    );
+    assert!(
+        !trace_out.contains("ACME") && !trace_out.contains("svc_veeam"),
+        "account leaked in clear in b.trace: {trace_out}"
+    );
+
+    // Pull the replacement principal out of each file. a.log carries a single
+    // backslash separator, b.trace a doubled one — everything else around the
+    // match is unchanged, so stripping the known prefix/suffix isolates it.
+    let log_repl = log_out
+        .strip_prefix("logon ")
+        .and_then(|s| s.strip_suffix(" here\n"))
+        .expect("a.log layout must be unchanged around the match");
+    let (log_domain, log_user) = log_repl
+        .split_once('\\')
+        .expect("a.log replacement must keep a single separator");
+
+    let trace_repl = trace_out
+        .strip_prefix("{\"m\":\"json \\\"")
+        .and_then(|s| s.strip_suffix("\\\" here\"}\n"))
+        .expect("b.trace layout must be unchanged around the match");
+    let (trace_domain, trace_user) = trace_repl
+        .split_once("\\\\")
+        .expect("b.trace replacement must keep a doubled separator");
+
+    assert_eq!(
+        log_domain, trace_domain,
+        "same account must get the same domain word in both files: a.log={log_repl} \
+         b.trace={trace_repl}"
+    );
+    assert_eq!(
+        log_user, trace_user,
+        "same account must get the same user word in both files: a.log={log_repl} \
+         b.trace={trace_repl}"
+    );
+
+    // Reversing with the dictionary restores the original bytes exactly, for both
+    // files — the two raw forms must both still be present in the dictionary.
+    let dict_file = collect_files(dict.path())
+        .into_iter()
+        .find(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+        .expect("dictionary not written");
+    let o = run(&[
+        "--reverse",
+        dict_file.to_str().unwrap(),
+        "-d",
+        out.path().to_str().unwrap(),
+        "-o",
+        back.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(back.path().join("a.log")).unwrap(),
+        log_input,
+        "round trip through the dictionary must restore a.log's original bytes"
+    );
+    assert_eq!(
+        fs::read_to_string(back.path().join("b.trace")).unwrap(),
+        trace_input,
+        "round trip through the dictionary must restore b.trace's original bytes"
+    );
+}
