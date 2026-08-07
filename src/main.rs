@@ -165,6 +165,19 @@ static RE_DOMAIN_USER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b([a-zA-Z][a-zA-Z0-9-]{1,14})\\([a-zA-Z][a-zA-Z0-9._-]{2,30})\b").unwrap()
 });
 
+/// `DOMAIN\user` as spelled in JSON-encoded text, where a literal backslash is
+/// written `\\` — the form `RE_DOMAIN_USER` (one backslash) can never match.
+///
+/// Used only for `ContentKind::JsonEscaped`. Without it, a `.trace` file yields no
+/// `DOMAIN\user` at all: `ACME\\svc_veeam` gave only `ACME`, caught as a naked user,
+/// while the account name went through in clear (#8).
+static RE_DOMAIN_USER_ESCAPED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b([a-zA-Z][a-zA-Z0-9-]{1,14})\\\\([a-zA-Z][a-zA-Z0-9._-]{2,30})\b").unwrap()
+});
+
+/// The two-character sequence a JSON-escaped `DOMAIN\user` uses as separator.
+const ESCAPED_SEPARATOR: &str = r"\\";
+
 /// Local-machine user pattern: ".\username" (no domain prefix).
 /// Captures the username group only.
 static RE_LOCAL_USER: LazyLock<Regex> = LazyLock::new(|| {
@@ -1444,6 +1457,87 @@ struct ExtractConfig {
     db_list: HashSet<String>,
 }
 
+/// Validate one `DOMAIN\user` capture and record the whole match if it survives.
+///
+/// Shared by the plain (`DOMAIN\user`) and JSON-escaped (`DOMAIN\\user`) patterns so
+/// the two cannot drift apart on the rejection rules. The recorded key is the raw
+/// matched text, separator included: replacement is literal, over the bytes on disk.
+///
+/// `escapes_possible` is false for the escaped pattern — there the separator is an
+/// already-escaped literal backslash, so what follows it is real text, never an
+/// escape tail.
+fn record_domain_user(
+    out: &mut ExtractedEntities,
+    content: &str,
+    cap: &regex::Captures,
+    kind: ContentKind,
+    escapes_possible: bool,
+) {
+    let (Some(domain_match), Some(user_match), Some(full_match)) =
+        (cap.get(1), cap.get(2), cap.get(0))
+    else {
+        return;
+    };
+    let domain = domain_match.as_str();
+    let username = user_match.as_str();
+
+    // Reject when the "domain" segment is actually a file extension. Backup-file
+    // paths like "disk.vib\next" or "chain.vbk\n1024" make the DOMAIN\user regex
+    // fire with domain = vib/vbk/vbm/vrb/... — a false positive that --paranoid then
+    // re-flags as a leak (issue #2), because the backup-file stem replacement keeps
+    // the ".vib\..." tail.
+    if FILE_EXTENSIONS
+        .iter()
+        .any(|&ext| domain.eq_ignore_ascii_case(ext))
+    {
+        return;
+    }
+    if escapes_possible {
+        // Reject JSON/C escape sequences. `.trace` files are JSON-encoded, so
+        // "srv.contoso.com's" (an escaped apostrophe) makes this regex fire with
+        // domain = "com", user = "u0027s". That mapping is junk, it rewrites ordinary
+        // escaped text, and --paranoid then reports the surviving "com'" as a
+        // leak. A real account whose name is u+4 hex digits is missed instead — the
+        // safer direction ("miss rather than corrupt").
+        if is_escape_sequence(username) {
+            return;
+        }
+        // In JSON-encoded content the escape family is wider: `\t`, `\n`, `\f`, `\r`,
+        // `\b` produce the same junk ("col1\tsep2" -> domain col1 / user tsep2) and
+        // corrupt the escape on write, turning valid JSON into invalid. Rejecting
+        // them loses nothing real — see `starts_with_json_escape`.
+        if kind == ContentKind::JsonEscaped && starts_with_json_escape(username) {
+            return;
+        }
+    }
+    // Reject Windows path segments: a "word\word" flanked by another path separator
+    // (e.g. ...\VeeamBackup\Backup_Job_1\... or \ResourceScan\Task_host_...) is a
+    // directory path, not a real DOMAIN\user account. Genuine DOMAIN\user tokens are
+    // surrounded by whitespace/punctuation, not by a separator.
+    let before = &content[..full_match.start()];
+    let after = &content[full_match.end()..];
+    let flanked_by_separator = if escapes_possible {
+        matches!(before.chars().next_back(), Some('\\') | Some('/'))
+            || matches!(after.chars().next(), Some('\\') | Some('/'))
+    } else {
+        // In JSON-encoded text the separator itself is a doubled backslash, so a path
+        // is a run of `\\`-separated segments and only a *doubled* neighbour means
+        // "path". Testing for a single one rejects the common real case instead: a
+        // `DOMAIN\\user` at the end of a JSON string is followed by the `\"` that
+        // closes it, which is ordinary escaped text, not a path separator.
+        before.ends_with(ESCAPED_SEPARATOR)
+            || after.starts_with(ESCAPED_SEPARATOR)
+            || matches!(before.chars().next_back(), Some('/'))
+            || matches!(after.chars().next(), Some('/'))
+    };
+    if flanked_by_separator {
+        return;
+    }
+    if is_valid_username(username) {
+        out.domain_users.insert(full_match.as_str().to_string());
+    }
+}
+
 /// Extract all entities from plain text content (v2.3 extended).
 fn extract_entities(content: &str, cfg: &ExtractConfig) -> ExtractedEntities {
     extract_entities_of_kind(content, cfg, ContentKind::Plain)
@@ -1471,59 +1565,15 @@ fn extract_entities_of_kind(
         }
     }
 
-    // Extract DOMAIN\username
+    // Extract DOMAIN\username. In JSON-encoded content a literal backslash is
+    // written `\\`, so the escaped pattern is the one that finds real accounts
+    // there — the single-backslash pattern only ever matched escape tails (#8).
     for cap in RE_DOMAIN_USER.captures_iter(content) {
-        if let (Some(domain_match), Some(user_match)) = (cap.get(1), cap.get(2)) {
-            let domain = domain_match.as_str();
-            let username = user_match.as_str();
-            // Reject when the "domain" segment is actually a file extension.
-            // Backup-file paths like "disk.vib\next" or "chain.vbk\n1024" make
-            // the DOMAIN\user regex fire with domain = vib/vbk/vbm/vrb/... — a
-            // false positive that --paranoid then re-flags as a leak (issue #2),
-            // because the backup-file stem replacement keeps the ".vib\..." tail.
-            if FILE_EXTENSIONS
-                .iter()
-                .any(|&ext| domain.eq_ignore_ascii_case(ext))
-            {
-                continue;
-            }
-            // Reject JSON/C escape sequences. `.trace` files are JSON-encoded, so
-            // "srv.contoso.com's" (an escaped apostrophe) makes this regex fire
-            // with domain = "com", user = "u0027s". That mapping is junk, it rewrites
-            // ordinary escaped text, and --paranoid then reports the surviving
-            // "com'" as a leak. A real account whose name is u+4 hex digits is
-            // missed instead — the safer direction ("miss rather than corrupt").
-            if is_escape_sequence(username) {
-                continue;
-            }
-            // In JSON-encoded content the escape family is wider: `\t`, `\n`, `\f`,
-            // `\r`, `\b` produce the same junk ("col1\tsep2" -> domain col1 / user
-            // tsep2) and corrupt the escape on write, turning valid JSON into
-            // invalid. Rejecting them loses nothing real — see
-            // `starts_with_json_escape`.
-            if kind == ContentKind::JsonEscaped && starts_with_json_escape(username) {
-                continue;
-            }
-            // Reject Windows path segments: a "word\word" flanked by another
-            // path separator (e.g. ...\VeeamBackup\Backup_Job_1\... or
-            // \ResourceScan\Task_host_...) is a directory path, not a real
-            // DOMAIN\user account. Genuine DOMAIN\user tokens are surrounded by
-            // whitespace/punctuation, not by '\' or '/'. (Avoids the path-leak
-            // false positives seen in real bundles.)
-            if let Some(full_match) = cap.get(0) {
-                let start = full_match.start();
-                let end = full_match.end();
-                let before = content[..start].chars().next_back();
-                let after = content[end..].chars().next();
-                if matches!(before, Some('\\') | Some('/'))
-                    || matches!(after, Some('\\') | Some('/'))
-                {
-                    continue;
-                }
-                if is_valid_username(username) {
-                    out.domain_users.insert(full_match.as_str().to_string());
-                }
-            }
+        record_domain_user(&mut out, content, &cap, kind, true);
+    }
+    if kind == ContentKind::JsonEscaped {
+        for cap in RE_DOMAIN_USER_ESCAPED.captures_iter(content) {
+            record_domain_user(&mut out, content, &cap, kind, false);
         }
     }
 
@@ -1944,10 +1994,20 @@ fn build_map(
 
     // STEP 3: Generate domain user replacements (collision-checked)
     for domain_user in &domain_users {
+        // A match from JSON-encoded content carries a doubled backslash, and the
+        // replacement has to as well: emitting one backslash where the source had an
+        // escaped pair turns `"ACME\\svc"` into `"XXXX\YYYY"`, i.e. an invalid JSON
+        // escape — the same corruption the escape-rejection rule exists to avoid.
+        let separator = if domain_user.contains(ESCAPED_SEPARATOR) {
+            ESCAPED_SEPARATOR
+        } else {
+            "\\"
+        };
         let candidate = loop {
             let c = format!(
-                "{}\\{}",
+                "{}{}{}",
                 generate_random_string(8),
+                separator,
                 generate_random_string(10)
             );
             if used_user_pairs.insert(c.clone()) {
@@ -4339,6 +4399,77 @@ mod tests {
         assert!(
             !plain.domain_users.is_empty(),
             "plain-text detection must be unaffected"
+        );
+    }
+
+    /// A genuine account in JSON-encoded text is written `DOMAIN\\user`, which the
+    /// single-backslash pattern can never match — it used to go through in clear (#8).
+    #[test]
+    fn json_escaped_domain_user_is_detected() {
+        let cfg = ExtractConfig {
+            aggressive: false,
+            user_list: HashSet::new(),
+            hostname_list: HashSet::new(),
+            object_list: HashSet::new(),
+            db_list: HashSet::new(),
+        };
+        // As stored on disk: {"m":"quoted \"ACME\\svc_veeam\" logged on"}
+        let content = r#"{"m":"quoted \"ACME\\svc_veeam\" logged on"}"#;
+
+        let json = extract_entities_of_kind(content, &cfg, ContentKind::JsonEscaped);
+        assert!(
+            json.domain_users.contains(r"ACME\\svc_veeam"),
+            "escaped DOMAIN\\\\user must be detected with its doubled separator, got: {:?}",
+            json.domain_users
+        );
+    }
+
+    /// A JSON-encoded Windows path is a run of `\\`-separated segments and must not be
+    /// mistaken for an account — the doubled neighbour is what marks it as a path.
+    #[test]
+    fn json_escaped_windows_path_is_not_a_domain_user() {
+        let cfg = ExtractConfig {
+            aggressive: false,
+            user_list: HashSet::new(),
+            hostname_list: HashSet::new(),
+            object_list: HashSet::new(),
+            db_list: HashSet::new(),
+        };
+        let content = r#"{"m":"path C:\\Program\\VeeamBackup\\Backup_Job_1\\run.log"}"#;
+
+        let json = extract_entities_of_kind(content, &cfg, ContentKind::JsonEscaped);
+        assert!(
+            json.domain_users.is_empty(),
+            "JSON-encoded path segments must not become domain users, got: {:?}",
+            json.domain_users
+        );
+    }
+
+    /// The replacement has to carry the same number of backslashes as the key, or the
+    /// output stops being valid JSON.
+    #[test]
+    fn escaped_domain_user_replacement_keeps_doubled_separator() {
+        let mut raw = ExtractedEntities::default();
+        raw.domain_users.insert(r"ACME\\svc_veeam".to_string());
+        raw.domain_users.insert(r"CORP\jdoe".to_string());
+        let cfg = ExtractConfig {
+            aggressive: false,
+            user_list: HashSet::new(),
+            hostname_list: HashSet::new(),
+            object_list: HashSet::new(),
+            db_list: HashSet::new(),
+        };
+        let map = build_map(raw, &ExcludeFilter::none(), &cfg);
+
+        let escaped = &map.domain_users[r"ACME\\svc_veeam"];
+        assert!(
+            escaped.contains(r"\\"),
+            "escaped key must get a doubled separator, got: {escaped}"
+        );
+        let plain = &map.domain_users[r"CORP\jdoe"];
+        assert!(
+            !plain.contains(r"\\") && plain.contains('\\'),
+            "plain key must keep a single separator, got: {plain}"
         );
     }
 

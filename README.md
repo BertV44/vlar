@@ -110,8 +110,34 @@ left `--paranoid` reporting phantom leaks. Single-backslash escapes (`\b \f \n \
 no longer treated as `DOMAIN\user` in JSON-encoded content. Plain-text `.log` detection is
 unchanged.
 
-> **Known gap:** a genuine `DOMAIN\user` inside a `.trace` is written `DOMAIN\\user` and is *not*
-> currently detected. Use `--user-list` for service accounts that matter in trace files.
+## What's new in v2.7.1
+
+### `DOMAIN\user` is now detected in JSON-encoded traces
+
+v2.7 stopped `RE_DOMAIN_USER` from firing on single-backslash escapes in `.trace` / `.json`
+content, which removed a large class of false positives. The mirror-image problem remained: a
+*genuine* account is written `DOMAIN\\svc_veeam` there, which a one-backslash pattern can never
+match, so it went through in clear while `--paranoid` reported the file clean.
+
+A second pattern now handles the escaped form. Two details matter:
+
+- The mapping key is the raw matched text, doubled separator included — replacement is literal,
+  over the bytes on disk.
+- The replacement carries the same number of backslashes. Emitting one where the source had an
+  escaped pair would turn `"ACME\\svc"` into `"XXXX\YYYY"`, an invalid JSON escape — the same
+  corruption the v2.7 rule exists to avoid, from the other direction.
+
+Path segments are still left alone. In JSON-encoded text a Windows path is a run of
+`\\`-separated segments, so only a *doubled* neighbour marks a match as a path — testing for a
+single one would reject the common real case, since a `DOMAIN\\user` at the end of a JSON string
+is followed by the `\"` that closes it.
+
+```
+before:  {"m":"quoted \"ACME\\svc_veeam\" logged on"}   ->  unchanged, --paranoid clean
+after:   {"m":"quoted \"CEinQneP\\8KnzghAb2Y\" logged on"}
+```
+
+`--reverse` restores the original bytes exactly. Closes #8.
 
 ## What's new in v2.6.1
 

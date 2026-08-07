@@ -2246,3 +2246,91 @@ fn json_escape_is_not_a_domain_user() {
         "escape sequence was corrupted: {content}"
     );
 }
+
+/// A genuine account inside a JSON-encoded `.trace` is written `DOMAIN\\user`, which
+/// the single-backslash pattern never matched — the service account shipped in clear
+/// while `--paranoid` reported the file clean (#8). The replacement must keep the
+/// doubled separator, or the anonymized line stops being valid JSON.
+#[test]
+fn escaped_domain_user_in_trace_is_anonymized_and_reversible() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let back = TempDir::new().unwrap();
+    let dict = TempDir::new().unwrap();
+
+    // As stored on disk, all three lines valid JSON:
+    //   1. a real account   -> must be anonymized
+    //   2. a Windows path    -> must be left alone
+    //   3. a \t escape       -> must be left alone
+    let input = concat!(
+        r#"{"m":"quoted \"ACME\\svc_veeam\" logged on"}"#,
+        "\n",
+        r#"{"m":"path C:\\Program\\VeeamBackup\\Backup_Job_1\\run.log"}"#,
+        "\n",
+        r#"{"m":"col1\tsep2 on srv.corp.com"}"#,
+        "\n"
+    );
+    fs::write(src.path().join("p.trace"), input).unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--paranoid",
+        "-D",
+        "--dict-output",
+        dict.path().to_str().unwrap(),
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let got = fs::read_to_string(out.path().join("p.trace")).unwrap();
+    assert!(
+        !got.contains("svc_veeam"),
+        "escaped DOMAIN\\\\user leaked in clear: {got}"
+    );
+    assert!(
+        got.contains(r"\\"),
+        "the doubled separator must survive, or the line is no longer valid JSON: {got}"
+    );
+    // The path and the tab escape are untouched.
+    assert!(
+        got.contains(r"VeeamBackup\\Backup_Job_1"),
+        "JSON-encoded path was rewritten: {got}"
+    );
+    assert!(
+        got.contains(r"col1\tsep2"),
+        "tab escape was rewritten: {got}"
+    );
+
+    // Reversing with the dictionary restores the original bytes exactly.
+    let dict_file = collect_files(dict.path())
+        .into_iter()
+        .find(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+        .expect("dictionary not written");
+    let o = run(&[
+        "--reverse",
+        dict_file.to_str().unwrap(),
+        "-d",
+        out.path().to_str().unwrap(),
+        "-o",
+        back.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(back.path().join("p.trace")).unwrap(),
+        input,
+        "round trip through the dictionary must restore the original bytes"
+    );
+}
