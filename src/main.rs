@@ -3203,6 +3203,13 @@ fn reverse_anonymize(dict_path: &Path, input_files: &[PathBuf], cli: &Cli) -> Re
         if indices.len() < 2 {
             continue;
         }
+        // Repeated entries carrying the *same* original are not ambiguous at all —
+        // a dictionary concatenated with itself, or exported twice, still says
+        // exactly one thing about this value. Only distinct originals compete.
+        let distinct: HashSet<&str> = indices.iter().map(|&i| candidates[i].1.as_str()).collect();
+        if distinct.len() < 2 {
+            continue;
+        }
         if indices.iter().all(|&i| candidates[i].2) {
             // Exactly the situation this fix exists for: several distinct
             // originals — real IPv4 addresses — were always going to mask to
@@ -4232,11 +4239,33 @@ fn transform_entry(
 struct EntryPathFixups {
     rewritten: Vec<(String, String)>,
     dropped: Vec<String>,
+    /// Destinations already handed out, so two entries can never land on one file.
+    used: HashSet<String>,
+}
+
+/// True when an entry name would resolve outside the directory it is joined onto.
+///
+/// Checked explicitly rather than by comparing the name against its sanitised form:
+/// `safe_relative` also normalises harmless spellings — a directory entry ends in
+/// `/`, and `./x.log` carries a no-op segment — and a comparison flags those as
+/// escapes. That misfires on essentially every archive produced by `zip -r`, which
+/// would bury the real warning under noise on every ordinary bundle and destroy the
+/// signal this reporting exists to give.
+fn entry_name_escapes(name: &str) -> bool {
+    if name.starts_with('/') || name.starts_with('\\') {
+        return true;
+    }
+    name.split(['/', '\\']).any(|seg| {
+        seg == ".."
+            || (seg.len() == 2
+                && seg.as_bytes()[0].is_ascii_alphabetic()
+                && seg.as_bytes()[1] == b':')
+    })
 }
 
 impl EntryPathFixups {
-    /// Reduce an entry's destination to something that cannot escape the output,
-    /// recording whatever had to change.
+    /// Reduce an entry's destination to something that cannot escape the output and
+    /// cannot collide with a destination already used, recording what had to change.
     ///
     /// Sanitising happens here, at the point of use, rather than where entry names
     /// are anonymized: the value that actually reaches `out_dir.join()` or
@@ -4244,17 +4273,47 @@ impl EntryPathFixups {
     /// here means a later change to name anonymization cannot quietly reopen the
     /// hole.
     fn resolve(&mut self, anon_name: &str) -> Option<PathBuf> {
+        let escapes = entry_name_escapes(anon_name);
         let Some(safe) = safe_relative(anon_name) else {
             self.dropped.push(anon_name.to_string());
             return None;
         };
-        if safe.to_string_lossy().replace('\\', "/") != anon_name {
-            self.rewritten.push((
-                anon_name.to_string(),
-                safe.to_string_lossy().replace('\\', "/"),
-            ));
+        // Stripping traversal collapses distinct entries onto one name — `dup.log`
+        // and `../dup.log` both become `dup.log`. Left alone that silently
+        // overwrote one entry's content when extracting, and made `ZipWriter`
+        // reject the duplicate when repacking, aborting the run with a partial
+        // archive on disk. Neither is acceptable for entries whose content was
+        // anonymized and is meant to be delivered, so collisions get a suffix.
+        let mut name = entry_name_for_zip(&safe);
+        if self.used.contains(&name) {
+            let base = safe
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let ext = safe
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let parent = safe
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| format!("{}/", entry_name_for_zip(p)))
+                .unwrap_or_default();
+            let mut n = 1;
+            loop {
+                let candidate = format!("{parent}{base}-{n}{ext}");
+                if !self.used.contains(&candidate) {
+                    name = candidate;
+                    break;
+                }
+                n += 1;
+            }
         }
-        Some(safe)
+        if escapes || name != entry_name_for_zip(&safe) {
+            self.rewritten.push((anon_name.to_string(), name.clone()));
+        }
+        self.used.insert(name.clone());
+        Some(PathBuf::from(name))
     }
 
     fn report(&self) {
@@ -4262,7 +4321,7 @@ impl EntryPathFixups {
             return;
         }
         eprintln!(
-            "  ⚠ {} zip entr(ies) had a path that would have written outside the output:",
+            "  ⚠ {} zip entr(ies) could not be written under their own name:",
             self.rewritten.len() + self.dropped.len()
         );
         for (from, to) in &self.rewritten {
@@ -4271,9 +4330,12 @@ impl EntryPathFixups {
         for from in &self.dropped {
             eprintln!("      {from}  ->  dropped (nothing left after removing traversal)");
         }
-        eprintln!("    Entry names are taken from the input archive, which is untrusted: an entry");
-        eprintln!("    named `../../x` would otherwise land outside -o, and be repacked into the");
-        eprintln!("    archive you send on. The content itself was anonymized as usual.");
+        eprintln!(
+            "    Entry names come from the input archive, which is untrusted: an entry named"
+        );
+        eprintln!("    `../../x` would otherwise land outside -o and be repacked into the archive");
+        eprintln!("    you send on. Names that collide once made relative get a numeric suffix so");
+        eprintln!("    no entry is lost. The content itself was anonymized as usual.");
     }
 }
 
@@ -4336,8 +4398,11 @@ fn write_zip_output(
         writer.write_all(&out_bytes)?;
     }
 
-    writer.finish()?;
+    // Reported before finishing the archive: if writing out the central directory
+    // fails, the operator still learns that the input carried hostile names, which
+    // is very likely why it failed.
     fixups.report();
+    writer.finish()?;
     Ok(())
 }
 

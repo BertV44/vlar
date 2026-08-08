@@ -123,16 +123,29 @@ output listing. `--output-zip` repacked the traversal name verbatim, so the arch
 support was itself a zip-slip archive aimed at whoever extracts it.
 
 Both writers now reduce every destination to a safe relative path, covering `../`, absolute names
-and Windows drive/UNC shapes. Entries are **contained, not dropped** — the content is still
-anonymized and still delivered — and every rewrite is reported:
+and Windows drive/UNC shapes. Entries are **contained rather than discarded** — the content is
+still anonymized and still delivered — and every rewrite is reported:
 
 ```
-  ⚠ 2 zip entr(ies) had a path that would have written outside the output:
+  ⚠ 2 zip entr(ies) could not be written under their own name:
       ../../ESCAPED.log  ->  ESCAPED.log
-      /tmp/ABS.log       ->  tmp/ABS.log
+      /tmp/ABS.log  ->  tmp/ABS.log
+    Entry names come from the input archive, which is untrusted: an entry named
+    `../../x` would otherwise land outside -o and be repacked into the archive
+    you send on. Names that collide once made relative get a numeric suffix so
+    no entry is lost. The content itself was anonymized as usual.
 ```
 
-Silently fixing a hostile bundle would deny you the only signal that you received one.
+Silently fixing a hostile bundle would deny you the only signal that you received one — so the
+warning has to stay rare. It fires only on a name that genuinely escapes; a trailing `/` on a
+directory entry or a `./` prefix is normalisation, not an escape, and stays quiet. Otherwise
+every archive produced by `zip -r` would trip it and the signal would be worthless.
+
+Two edge cases are handled rather than left to chance. An entry whose name reduces to nothing
+(`../..`) is dropped and listed as such. Entries that collide once made relative — `dup.log` and
+`../dup.log` both want `dup.log` — get a numeric suffix (`dup-1.log`), because the alternative is
+overwriting one entry's anonymized content when extracting, or having the zip writer reject the
+duplicate and abort with a partial archive on disk.
 
 ### `--validate-only` no longer leaks names through file paths (#11)
 
@@ -160,12 +173,13 @@ and named in a warning with every candidate original. A duplicate touching a col
 kind can only come from a tampered dictionary, and still aborts.
 
 ```
-  ⚠ 1 anonymized value(s) cannot be reversed — IPv4 masking keeps only the last two
-    octets, so distinct addresses that share them produce the same masked string:
-      **.**.1.10 <- could be any of: 10.0.1.10, 192.168.1.10
+  ⚠ 1 anonymized value(s) cannot be reversed — IPv4 masking keeps only the last two octets, so distinct addresses that share them produce the same masked string:
+    **.**.1.10 <- could be any of: 10.0.1.10, 192.168.1.10
+    Left as-is in the restored output. Everything else — including other entities in the same files — is restored normally.
 ```
 
-The mask format in anonymized output is unchanged.
+Repeated entries carrying the same original — a dictionary exported twice, or concatenated — are
+not ambiguous and reverse normally. The mask format in anonymized output is unchanged.
 
 ## What's new in v2.7.1
 

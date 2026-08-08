@@ -2682,8 +2682,9 @@ fn zip_traversal_entry_stays_inside_output_dir() {
     // And the operator is told, rather than it being fixed in silence.
     let stderr = String::from_utf8_lossy(&o.stderr);
     assert!(
-        stderr.contains("outside the output"),
-        "rewritten entries must be reported. stderr: {stderr}"
+        stderr.contains("could not be written under their own name")
+            && stderr.contains("../../ESCAPED.log"),
+        "rewritten entries must be reported by name. stderr: {stderr}"
     );
 }
 
@@ -2804,7 +2805,7 @@ fn ordinary_zip_unaffected_by_path_sanitising() {
     );
     let stderr = String::from_utf8_lossy(&o.stderr);
     assert!(
-        !stderr.contains("outside the output"),
+        !stderr.contains("could not be written under their own name"),
         "a clean bundle must not trigger the warning. stderr: {stderr}"
     );
 }
@@ -2976,5 +2977,169 @@ fn reverse_still_rejects_genuine_corruption_outside_ipv4() {
     assert!(
         rel_paths(back.path()).is_empty(),
         "nothing should be written once genuine corruption is detected"
+    );
+}
+
+/// Real bundles carry directory entries (`Svc/`) and `./` prefixes. Those are
+/// spelling, not escapes — reporting them fires the hostile-bundle warning on
+/// essentially every archive produced by `zip -r`, which buries the real signal.
+/// `make_zip` only ever calls `start_file`, so a fixture built with it cannot
+/// catch this; this one adds directory entries explicitly.
+#[test]
+fn ordinary_zip_with_directory_entries_raises_no_warning() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("bundle.zip");
+    let out_zip = dir.path().join("anon.zip");
+    {
+        use std::io::Write;
+        let file = fs::File::create(&in_zip).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.add_directory("Svc/", opts).unwrap();
+        zw.start_file("Svc/a.log", opts).unwrap();
+        zw.write_all(b"a admin@corp.com\n").unwrap();
+        zw.add_directory("Svc/Util/", opts).unwrap();
+        zw.start_file("Svc/Util/b.log", opts).unwrap();
+        zw.write_all(b"b bob@corp.com\n").unwrap();
+        zw.start_file("./c.log", opts).unwrap();
+        zw.write_all(b"c carol@corp.com\n").unwrap();
+        zw.finish().unwrap();
+    }
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--keep-path-names",
+    ]);
+    assert!(o.status.success());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !stderr.contains("could not be written under their own name"),
+        "directory entries and ./ prefixes are not escapes. stderr: {stderr}"
+    );
+    let names: Vec<String> = read_zip(&out_zip).into_iter().map(|(n, _)| n).collect();
+    assert!(
+        names.contains(&"Svc/Util/b.log".to_string()),
+        "nested entry must survive: {names:?}"
+    );
+}
+
+/// Stripping traversal collapses distinct entries onto one name. Overwriting one
+/// of them loses anonymized content that was meant to be delivered; letting the
+/// zip writer reject the duplicate aborts the run with a partial archive on disk.
+/// Both are worse than a suffix.
+#[test]
+fn colliding_sanitised_names_keep_every_entry() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("col.zip");
+    make_zip_raw(
+        &in_zip,
+        &[
+            ("dup.log", "one admin@corp.com\n"),
+            ("../dup.log", "two erin@corp.com\n"),
+            ("./dup.log", "three carol@corp.com\n"),
+            ("keep.log", "four bob@corp.com\n"),
+        ],
+    );
+
+    // Repack: every entry present, unique names, run succeeds.
+    let out_zip = dir.path().join("anon.zip");
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "collision must not abort the run. stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let entries = read_zip(&out_zip);
+    assert_eq!(entries.len(), 4, "every entry must survive: {entries:?}");
+    let mut names: Vec<&String> = entries.iter().map(|(n, _)| n).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 4, "names must be unique: {names:?}");
+
+    // Extract: same, on disk.
+    let out_dir = TempDir::new().unwrap();
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "-o",
+        out_dir.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(o.status.success());
+    let files = collect_files(out_dir.path());
+    assert_eq!(
+        files.len(),
+        4,
+        "no entry may be silently overwritten: {files:?}"
+    );
+    // The four distinct payloads are all still there, none clobbered.
+    let bodies: Vec<String> = files
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap_or_default())
+        .collect();
+    for marker in ["one", "two", "three", "four"] {
+        assert!(
+            bodies.iter().any(|b| b.starts_with(marker)),
+            "{marker} lost to a collision; got {bodies:?}"
+        );
+    }
+}
+
+/// A dictionary exported twice, or concatenated with itself, repeats entries that
+/// carry the *same* original. That says exactly one thing about the value, so it
+/// must still reverse — only genuinely competing originals are ambiguous.
+#[test]
+fn repeated_identical_ipv4_entry_still_reverses() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("out");
+    let back = dir.path().join("back");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("a.log"), "host at **.**.30.40 done\n").unwrap();
+    let dict = dir.path().join("d.json");
+    fs::write(
+        &dict,
+        r#"{"metadata":{"version":"2.7.2","created_at":"2026-08-08T00:00:00Z","files_processed":1,"total_entities":2},
+            "mappings":{"ip_addresses":[
+              {"original":"10.20.30.40","anonymized":"**.**.30.40"},
+              {"original":"10.20.30.40","anonymized":"**.**.30.40"}]}}"#,
+    )
+    .unwrap();
+
+    let o = run(&[
+        "--reverse",
+        dict.to_str().unwrap(),
+        "-d",
+        out.to_str().unwrap(),
+        "-o",
+        back.to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !stderr.contains("could be any of"),
+        "an entry repeated identically is not ambiguous. stderr: {stderr}"
+    );
+    let restored = fs::read_to_string(back.join("a.log")).unwrap();
+    assert!(
+        restored.contains("10.20.30.40"),
+        "should have been restored: {restored}"
     );
 }
