@@ -2526,12 +2526,47 @@ struct StageStats {
 
 /// Strip a zip entry name down to safe relative components.
 ///
-/// Zip entries can carry `..` or absolute paths ("zip slip"); joining those onto an
-/// output root writes outside it. Keep only plain components.
+/// Zip entries can carry `..`, a leading `/`, or a Windows drive/UNC shape
+/// ("zip slip"); joining any of those onto an output root writes outside it.
+/// Splitting on both `/` and `\` and dropping empty/`.`/`..` segments handles
+/// `../../x`, `/etc/passwd` (leading empty segment) and `\\server\share\x`
+/// (every separator run between "\\server" and "share" produces an empty
+/// segment too) uniformly. Keep only plain components.
+/// `Some(remainder)` when a path segment opens with a Windows drive prefix.
+///
+/// `"C:"` yields `""` (the prefix was the whole segment); `"C:REL.log"` yields
+/// `"REL.log"`.
+fn strip_drive_prefix(seg: &str) -> Option<&str> {
+    let b = seg.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        Some(&seg[2..])
+    } else {
+        None
+    }
+}
+
 fn safe_relative(name: &str) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for seg in name.split(['/', '\\']) {
         if seg.is_empty() || seg == "." || seg == ".." {
+            continue;
+        }
+        // A drive letter is a path *prefix* on Windows, not an ordinary component
+        // — `Path::join` special-cases a path carrying one: instead of extending
+        // `self` it discards it, exactly as it does for an absolute path. Letting
+        // it through would mean `out_dir.join(rel)` on a Windows build resolves to
+        // `C:\Windows\...`, replacing the output root entirely — the same escape as
+        // `../..`, spelled with a drive letter instead of dots.
+        //
+        // Both spellings have to go. `C:` alone is the separator-delimited form,
+        // but `C:REL.log` is drive-*relative* and carries no separator at all, so
+        // splitting never isolates it; only the prefix is dropped there, keeping
+        // the name it qualified.
+        if let Some(rest) = strip_drive_prefix(seg) {
+            if rest.is_empty() {
+                continue;
+            }
+            out.push(rest);
             continue;
         }
         out.push(seg);
@@ -2675,6 +2710,9 @@ fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
                 None => root.join(&base_name),
             };
             stats.archives += 1;
+            // Fresh per archive: each expands into its own `.extracted/` directory,
+            // so names only compete with others from the same archive.
+            let mut fixups = EntryPathFixups::default();
 
             for i in 0..archive.len() {
                 // A damaged entry skips that entry only. Aborting the whole run for
@@ -2694,7 +2732,12 @@ fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
                 if !entry_is_text(&name) {
                     continue;
                 }
-                let Some(safe) = safe_relative(&name) else {
+                // Same sanitising and collision handling the two output writers use.
+                // Without it, an archive holding both `dup.log` and `../dup.log`
+                // collapsed them onto one staged path and `create_new_file` refused
+                // the second, aborting the whole run and writing nothing — the exact
+                // failure removed from the other writers.
+                let Some(safe) = fixups.resolve(&name) else {
                     continue;
                 };
                 let dest = base.join(&safe);
@@ -3131,50 +3174,129 @@ fn reverse_anonymize(dict_path: &Path, input_files: &[PathBuf], cli: &Cli) -> Re
         );
     }
 
-    // Build reverse mapping: anonymized -> original
-    let mut reverse_pairs: Vec<(String, String)> = Vec::with_capacity(actual_count);
-
-    let sections: &[&Vec<DictEntry>] = &[
-        &dict.mappings.emails,
-        &dict.mappings.domains,
-        &dict.mappings.domain_users,
-        &dict.mappings.ip_addresses,
-        &dict.mappings.naked_users,
-        &dict.mappings.fqdns,
-        &dict.mappings.ipv6_addresses,
-        &dict.mappings.mac_addresses,
-        &dict.mappings.ssh_fps,
-        &dict.mappings.backup_files,
-        &dict.mappings.hostnames,
-        &dict.mappings.objects,
-        &dict.mappings.dbs,
+    // Build reverse mapping: anonymized -> original.
+    //
+    // Every section here is collision-checked at generation time EXCEPT
+    // ip_addresses: IPv4 masking keeps only the last two octets (see
+    // `anonymize_ip` / build_map STEP 4), so a proxy on 192.168.x.y and a
+    // repository on 10.a.x.y that merely share a host number — an ordinary
+    // addressing convention — land on the same masked string, with no
+    // `used_*` set to catch it the way the IPv6/MAC steps right below it do.
+    // That is a deliberate trade-off (the mask stays subnet-local and
+    // human-readable; it was never meant to double as a lossless
+    // identifier — see the README) and not a bug in the mapping itself.
+    // The bug was in what came next: treating the resulting duplicate the
+    // same as a tampered dictionary and aborting the whole run over it. The
+    // `is_lossy` flag carried alongside each candidate below is how the
+    // ambiguity check tells those two situations apart.
+    let sections: &[(&Vec<DictEntry>, bool)] = &[
+        (&dict.mappings.emails, false),
+        (&dict.mappings.domains, false),
+        (&dict.mappings.domain_users, false),
+        (&dict.mappings.ip_addresses, true),
+        (&dict.mappings.naked_users, false),
+        (&dict.mappings.fqdns, false),
+        (&dict.mappings.ipv6_addresses, false),
+        (&dict.mappings.mac_addresses, false),
+        (&dict.mappings.ssh_fps, false),
+        (&dict.mappings.backup_files, false),
+        (&dict.mappings.hostnames, false),
+        (&dict.mappings.objects, false),
+        (&dict.mappings.dbs, false),
     ];
-    for section in sections {
+    let mut candidates: Vec<(String, String, bool)> = Vec::with_capacity(actual_count);
+    for (section, is_lossy) in sections {
         for entry in *section {
             // SSH fingerprints are redacted (no recoverable original).
             // Skip them in reverse to avoid '[REDACTED]' → fingerprint collisions.
             if entry.anonymized.contains("[REDACTED") {
                 continue;
             }
-            reverse_pairs.push((entry.anonymized.clone(), entry.original.clone()));
+            candidates.push((entry.anonymized.clone(), entry.original.clone(), *is_lossy));
         }
     }
 
-    // Sort longest first for maximal munch
-    reverse_pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
+    println!("  Loaded {} mappings from dictionary", candidates.len());
 
-    // Detect collisions in anonymized values (would make reverse ambiguous)
-    let mut seen = HashSet::new();
-    for (anon, _) in &reverse_pairs {
-        if !seen.insert(anon.to_lowercase()) {
+    // Group by anonymized value to find collisions before deciding what to
+    // do about each one.
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (anon, _, _)) in candidates.iter().enumerate() {
+        groups.entry(anon.to_lowercase()).or_default().push(i);
+    }
+
+    let mut excluded: HashSet<usize> = HashSet::new();
+    let mut unresolved: Vec<(String, Vec<String>)> = Vec::new();
+    for indices in groups.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        // Repeated entries carrying the *same* original are not ambiguous at all —
+        // a dictionary concatenated with itself, or exported twice, still says
+        // exactly one thing about this value. Only distinct originals compete.
+        let distinct: HashSet<&str> = indices.iter().map(|&i| candidates[i].1.as_str()).collect();
+        if distinct.len() < 2 {
+            continue;
+        }
+        if indices.iter().all(|&i| candidates[i].2) {
+            // Exactly the situation this fix exists for: several distinct
+            // originals — real IPv4 addresses — were always going to mask to
+            // the same string, because the mask keeps only the last two
+            // octets. There is no way to tell which original produced this
+            // anonymized value, so it is left as-is in the restored output
+            // rather than guessed at; everything else in the dictionary,
+            // including other entities in the same files, is unaffected.
+            let anon = candidates[indices[0]].0.clone();
+            let mut originals: Vec<String> =
+                indices.iter().map(|&i| candidates[i].1.clone()).collect();
+            originals.sort();
+            // The group can hold the same original more than once (a dictionary
+            // exported twice); listing it twice would suggest it competes with
+            // itself.
+            originals.dedup();
+            unresolved.push((anon, originals));
+            excluded.extend(indices.iter().copied());
+        } else {
+            // A collision outside the known one-way entity kinds means two
+            // logically distinct values were handed the *same* replacement
+            // by code whose whole job is to guarantee that never happens
+            // (the `used_*` sets in build_map). Unlike the IPv4 case above,
+            // there is no legitimate reason for that, so this can only mean
+            // the dictionary was hand-edited, merged, or otherwise tampered
+            // with after export — abort rather than restore from it.
             anyhow::bail!(
-                "Dictionary corruption: anonymized value '{}' appears multiple times — reverse mapping is ambiguous",
-                anon
+                "Dictionary corruption: anonymized value '{}' appears multiple times outside \
+                 the known one-way entity kinds (IPv4) — reverse mapping is ambiguous",
+                candidates[indices[0]].0
             );
         }
     }
 
-    println!("  Loaded {} mappings from dictionary", reverse_pairs.len());
+    if !unresolved.is_empty() {
+        unresolved.sort_by(|a, b| a.0.cmp(&b.0));
+        eprintln!(
+            "  ⚠ {} anonymized value(s) cannot be reversed — IPv4 masking keeps only the last \
+             two octets, so distinct addresses that share them produce the same masked string:",
+            unresolved.len()
+        );
+        for (anon, originals) in &unresolved {
+            eprintln!("    {} <- could be any of: {}", anon, originals.join(", "));
+        }
+        eprintln!(
+            "    Left as-is in the restored output. Everything else — including other entities \
+             in the same files — is restored normally."
+        );
+    }
+
+    let mut reverse_pairs: Vec<(String, String)> = candidates
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !excluded.contains(i))
+        .map(|(_, (anon, orig, _))| (anon, orig))
+        .collect();
+
+    // Sort longest first for maximal munch
+    reverse_pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
 
     // Reverse path-safe pairs (anonymized → original) to restore the original
     // file/directory names. Mirrors collect_path_replacement_pairs: only the
@@ -3769,6 +3891,33 @@ struct ScannedUnit {
 }
 
 /// Build the validate-only JSON report from scanned units + the explicit lists.
+///
+/// `by_file[].file` and `source` are run through the exact same path-anonymization
+/// mapping a real anonymizing run would apply to its output tree — built from this
+/// scan's own union of entities via `build_map` + `collect_path_replacement_pairs`,
+/// the same two calls `run_anonymize`/`run_zip` make before writing anything. Before
+/// this fix the raw relative path was copied straight into `by_file[].file`: a folder
+/// named after a hostname or VM (`SRV-PROD-CRM01/Task.SRV-PROD-CRM01-vm-finance-db.log`)
+/// came out verbatim, even though the report's own docs promise entity counts "by kind
+/// and by file — never the original values" (issue #11). The one output built to be
+/// piped unattended into a pipeline was the one output that still leaked.
+///
+/// Because the map is randomly generated fresh per invocation (same as content
+/// anonymization already is), a report and a *separately run* anonymizing pass over
+/// the same input won't share literal hostname/email/domain tokens — that's an
+/// existing property of the tool, not something this fix changes. What *is*
+/// consistent across runs is the rendering: IPv4/IPv6/MAC use a deterministic mask
+/// (`10.0.0.21` → `xx.xx.0.21`, unaffected by run-to-run randomness) and every
+/// replacement is passed through the same `to_path_safe` transform a real output
+/// tree's names get, so a reader learns the same shape of name either way.
+///
+/// This anonymization is unconditional: `--keep-path-names` is deliberately NOT
+/// consulted here (see the note in `run_validate_only`). That flag lets a human opt a
+/// normal run's *output tree* out of renaming, because a human inspects that tree
+/// before deciding whether to share it. The validate-only report has no equivalent
+/// inspection step — it exists specifically to be piped straight into `jq`/automation —
+/// so honoring the flag here would just reopen this exact leak behind a switch whose
+/// documented purpose has nothing to do with report contents.
 fn build_validate_report(
     units: Vec<ScannedUnit>,
     exclude: &ExcludeFilter,
@@ -3777,34 +3926,21 @@ fn build_validate_report(
 ) -> ValidateReport {
     let files_scanned = units.len();
 
-    // Per-file section.
-    let mut by_file: Vec<FileEntities> = Vec::with_capacity(units.len());
+    // Pass 1: per-file (raw path, kind counts) + accumulate the union. Raw paths
+    // are held only transiently in `per_file` — they're anonymized in pass 2,
+    // below, before anything is assembled into the report.
+    let mut per_file: Vec<(String, Vec<(EntityKind, usize)>)> = Vec::with_capacity(units.len());
     let mut union = ExtractedEntities::default();
     for unit in units {
         let counts = kind_counts(&unit.entities, exclude);
-        let entity_count: usize = counts.iter().map(|(_, n)| n).sum();
-        if entity_count > 0 {
-            by_file.push(FileEntities {
-                file: unit.rel,
-                entity_count,
-                entities: counts
-                    .into_iter()
-                    .map(|(k, n)| KindCount {
-                        kind: k.to_string(),
-                        occurrences: n,
-                    })
-                    .collect(),
-            });
+        if counts.iter().map(|(_, n)| n).sum::<usize>() > 0 {
+            per_file.push((unit.rel, counts));
         }
         union.merge(unit.entities);
     }
-    by_file.sort_by(|a, b| {
-        b.entity_count
-            .cmp(&a.entity_count)
-            .then(a.file.cmp(&b.file))
-    });
 
-    // Global summary: unique auto-detected counts + explicit-list sizes.
+    // Global summary: unique auto-detected counts + explicit-list sizes. Computed
+    // from `union` by reference — `union` is moved into `build_map` right after.
     let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for (k, n) in kind_counts(&union, exclude) {
         by_kind.insert(k.to_string(), n);
@@ -3820,11 +3956,47 @@ fn build_validate_report(
     }
     let entities_total: usize = by_kind.values().sum();
 
+    // Same map a real anonymizing run over this input would build: content entities,
+    // whatever the union already picked up from path names (extract_entities_with_path
+    // scans both), and the hostname/object/db explicit lists — so report names match a
+    // real output tree name-for-name. Never persisted; it lives only for this call.
+    let map = build_map(union, exclude, cfg);
+    let path_pairs = collect_path_replacement_pairs(&map);
+    let anon_path = |raw: &str| -> String {
+        anonymize_relative_path(Path::new(raw), &path_pairs)
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    // Pass 2: assemble by_file with anonymized paths.
+    let mut by_file: Vec<FileEntities> = per_file
+        .into_iter()
+        .map(|(rel, counts)| {
+            let entity_count = counts.iter().map(|(_, n)| n).sum();
+            FileEntities {
+                file: anon_path(&rel),
+                entity_count,
+                entities: counts
+                    .into_iter()
+                    .map(|(k, n)| KindCount {
+                        kind: k.to_string(),
+                        occurrences: n,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    by_file.sort_by(|a, b| {
+        b.entity_count
+            .cmp(&a.entity_count)
+            .then(a.file.cmp(&b.file))
+    });
+
     ValidateReport {
         tool_version: VERSION.to_string(),
         mode: "validate-only".to_string(),
         scanned_at: Local::now().to_rfc3339(),
-        source: source.to_string(),
+        source: anon_path(source),
         product: "VBR".to_string(),
         summary: ValidateSummary {
             files_scanned,
@@ -3839,6 +4011,21 @@ fn build_validate_report(
 /// report to stdout or `--report-output`, writes nothing, and returns the
 /// deterministic exit code (2 if any entity detected, else 0).
 fn run_validate_only(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i32> {
+    // --keep-path-names governs the output TREE of a normal run, which a human
+    // reviews before deciding whether to share it. This report has no such review
+    // step by design — it is meant to be piped straight into jq/automation — so its
+    // path names stay anonymized even when --keep-path-names is set. Said here, once,
+    // rather than silently: a flag that visibly changes one output and silently not
+    // the other is the kind of surprise that erodes trust in the tool.
+    if cli.keep_path_names {
+        eprintln!(
+            "  ℹ --keep-path-names has no effect on the --validate-only report: its file/source"
+        );
+        eprintln!(
+            "    paths are always anonymized (the report is built for unattended pipelines)."
+        );
+    }
+
     let (units, source) = if cli.input_is_zip() {
         let zip_path = zip_input_path(cli);
         (
@@ -4074,6 +4261,157 @@ fn transform_entry(
 
 /// Repack: read each entry, anonymize, write into a new zip preserving the
 /// (anonymized) tree and last-modified timestamps. One entry at a time.
+/// Entry destinations that could not be used as-is, for reporting.
+///
+/// A `.zip` bundle is untrusted input — it arrives from a customer by mail or
+/// upload — so any entry that had to be rewritten is worth naming out loud rather
+/// than fixing in silence: it is the operator's only signal that the bundle was
+/// malformed or hostile.
+/// The two are reported separately because they mean different things to the
+/// operator: an escape says the bundle is malformed or hostile, a collision says two
+/// entries wanted the same destination — which happens on entirely ordinary bundles,
+/// most often because the filesystem-safe IP rendering is lossy (`Agent.10.0.1.21.log`
+/// and `Agent.192.168.1.21.log` both become `Agent.xx.xx.1.21.log`). Telling someone
+/// their bundle is untrusted because two of their proxies share a host number would
+/// be the same false alarm this reporting was rewritten to avoid.
+#[derive(Default)]
+struct EntryPathFixups {
+    escaped: Vec<(String, String)>,
+    collided: Vec<(String, String)>,
+    dropped: Vec<String>,
+    /// Destinations already handed out, so two entries can never land on one file.
+    used: HashSet<String>,
+}
+
+/// True when an entry name would resolve outside the directory it is joined onto.
+///
+/// Checked explicitly rather than by comparing the name against its sanitised form:
+/// `safe_relative` also normalises harmless spellings — a directory entry ends in
+/// `/`, and `./x.log` carries a no-op segment — and a comparison flags those as
+/// escapes. That misfires on essentially every archive produced by `zip -r`, which
+/// would bury the real warning under noise on every ordinary bundle and destroy the
+/// signal this reporting exists to give.
+fn entry_name_escapes(name: &str) -> bool {
+    if name.starts_with('/') || name.starts_with('\\') {
+        return true;
+    }
+    name.split(['/', '\\'])
+        .any(|seg| seg == ".." || strip_drive_prefix(seg).is_some())
+}
+
+impl EntryPathFixups {
+    /// Reduce an entry's destination to something that cannot escape the output and
+    /// cannot collide with a destination already used, recording what had to change.
+    ///
+    /// Sanitising happens here, at the point of use, rather than where entry names
+    /// are anonymized: the value that actually reaches `out_dir.join()` or
+    /// `ZipWriter::start_file()` is the one that has to be safe, and checking it
+    /// here means a later change to name anonymization cannot quietly reopen the
+    /// hole.
+    fn resolve(&mut self, anon_name: &str) -> Option<PathBuf> {
+        let escapes = entry_name_escapes(anon_name);
+        let Some(safe) = safe_relative(anon_name) else {
+            self.dropped.push(anon_name.to_string());
+            return None;
+        };
+        // Stripping traversal collapses distinct entries onto one name — `dup.log`
+        // and `../dup.log` both become `dup.log`. Left alone that silently
+        // overwrote one entry's content when extracting, and made `ZipWriter`
+        // reject the duplicate when repacking, aborting the run with a partial
+        // archive on disk. Neither is acceptable for entries whose content was
+        // anonymized and is meant to be delivered, so collisions get a suffix.
+        let mut name = entry_name_for_zip(&safe);
+        if self.used.contains(&name) {
+            let base = safe
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let ext = safe
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let parent = safe
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| format!("{}/", entry_name_for_zip(p)))
+                .unwrap_or_default();
+            let mut n = 1;
+            loop {
+                let candidate = format!("{parent}{base}-{n}{ext}");
+                if !self.used.contains(&candidate) {
+                    name = candidate;
+                    break;
+                }
+                n += 1;
+            }
+        }
+        if escapes {
+            self.escaped.push((anon_name.to_string(), name.clone()));
+        } else if name != entry_name_for_zip(&safe) {
+            self.collided.push((anon_name.to_string(), name.clone()));
+        }
+        self.used.insert(name.clone());
+        Some(PathBuf::from(name))
+    }
+
+    fn report(&self) {
+        if !self.escaped.is_empty() || !self.dropped.is_empty() {
+            eprintln!(
+                "  ⚠ {} zip entr(ies) had a name that points outside the output:",
+                self.escaped.len() + self.dropped.len()
+            );
+            for (from, to) in &self.escaped {
+                eprintln!("      {from}  ->  {to}");
+            }
+            for from in &self.dropped {
+                eprintln!("      {from}  ->  dropped (nothing left after removing traversal)");
+            }
+            eprintln!(
+                "    Entry names come from the input archive, which is untrusted: a name like"
+            );
+            eprintln!(
+                "    `../../x` would otherwise land outside -o and be repacked into the archive"
+            );
+            eprintln!("    you send on. Treat this bundle as malformed or hostile.");
+        }
+        if !self.collided.is_empty() {
+            eprintln!(
+                "  ⚠ {} zip entr(ies) wanted a destination already taken, and were renamed:",
+                self.collided.len()
+            );
+            for (from, to) in &self.collided {
+                eprintln!("      {from}  ->  {to}");
+            }
+            eprintln!(
+                "    Nothing hostile about this on its own — the filesystem-safe IP rendering"
+            );
+            eprintln!(
+                "    is lossy, so two addresses sharing their last two octets give one name."
+            );
+            eprintln!(
+                "    A numeric suffix keeps both. The content itself was anonymized as usual."
+            );
+        }
+    }
+}
+
+/// Report on the way out, however the writer returns.
+///
+/// An error part-way through the entry loop used to skip the report entirely, so an
+/// operator whose run died on a corrupt entry never learned that the same archive
+/// also carried traversal names — and in extract mode those files were already on
+/// disk by then. `Drop` runs on the error path too.
+impl Drop for EntryPathFixups {
+    fn drop(&mut self) {
+        self.report();
+    }
+}
+
+/// Zip entry name as a forward-slash string, for writing back into an archive.
+fn entry_name_for_zip(safe: &Path) -> String {
+    safe.to_string_lossy().replace('\\', "/")
+}
+
 fn write_zip_output(
     zip_path: &Path,
     out_zip: &Path,
@@ -4095,10 +4433,19 @@ fn write_zip_output(
         .with_context(|| format!("Failed to create output zip: {}", out_zip.display()))?;
     let mut writer = zip::ZipWriter::new(out_file);
 
+    let mut fixups = EntryPathFixups::default();
+
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let name = entry.name().to_string();
         let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names);
+        // Repacking a traversal name unchanged would hand the attack downstream:
+        // the archive going to support would itself write outside whatever
+        // directory the recipient extracts it into.
+        let Some(safe) = fixups.resolve(&anon_name) else {
+            continue;
+        };
+        let safe_name = entry_name_for_zip(&safe);
 
         let mut options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
@@ -4107,7 +4454,7 @@ fn write_zip_output(
         }
 
         if entry.is_dir() {
-            writer.add_directory(anon_name, options)?;
+            writer.add_directory(safe_name, options)?;
             continue;
         }
 
@@ -4115,7 +4462,7 @@ fn write_zip_output(
         entry.read_to_end(&mut bytes)?;
         let out_bytes = transform_entry(&name, bytes, map, exclude);
 
-        writer.start_file(anon_name, options)?;
+        writer.start_file(safe_name, options)?;
         writer.write_all(&out_bytes)?;
     }
 
@@ -4137,6 +4484,8 @@ fn extract_zip_output(
     let in_file = fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(in_file)?;
 
+    let mut fixups = EntryPathFixups::default();
+
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         if !entry.is_file() {
@@ -4144,7 +4493,13 @@ fn extract_zip_output(
         }
         let name = entry.name().to_string();
         let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names);
-        let out_path = out_dir.join(&anon_name);
+        // `out_dir.join()` happily walks out of `out_dir` when the entry name says
+        // so — `../../x` lands two levels above it, and an absolute or drive-letter
+        // name replaces it outright.
+        let Some(safe) = fixups.resolve(&anon_name) else {
+            continue;
+        };
+        let out_path = out_dir.join(&safe);
 
         if let Some(parent) = out_path.parent() {
             if !parent.exists() {

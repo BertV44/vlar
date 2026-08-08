@@ -1500,6 +1500,167 @@ fn validate_only_report_output_to_file() {
     assert!(report_json.contains("\"mode\": \"validate-only\""));
 }
 
+// ── issue #11: --validate-only report must not leak names via paths ──
+
+#[test]
+fn validate_only_report_anonymizes_hostname_and_object_in_path() {
+    let input_dir = TempDir::new().unwrap();
+    let list_dir = TempDir::new().unwrap();
+    let host_list = list_dir.path().join("hosts.txt");
+    let obj_list = list_dir.path().join("objects.txt");
+    fs::write(&host_list, "SRV-PROD-CRM01\n").unwrap();
+    fs::write(&obj_list, "vm-finance-db\n").unwrap();
+
+    // Same shape as the issue's reproduction: hostname as a directory name, VM
+    // name embedded in the file name. Content carries an auto-detected entity
+    // (an IP) too — kind_counts() treats hostname/object as list-injected/global
+    // rather than per-file, so a file with nothing auto-detected in its content
+    // never gets a `by_file` entry at all; the content entity is what makes this
+    // file (and therefore its path) show up in `by_file` to begin with.
+    let sub = input_dir.path().join("SRV-PROD-CRM01");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(
+        sub.join("Task.SRV-PROD-CRM01-vm-finance-db.log"),
+        "backup job ran, target 192.168.1.50\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "--validate-only",
+        "--hostname-list",
+        host_list.to_str().unwrap(),
+        "--object-list",
+        obj_list.to_str().unwrap(),
+    ]);
+
+    // Detected via the explicit lists, same deterministic exit code as any other run.
+    assert_eq!(out.status.code(), Some(2));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("SRV-PROD-CRM01") && !stdout.contains("vm-finance-db"),
+        "hostname/VM name must not appear verbatim anywhere in the report. Got: {}",
+        stdout
+    );
+
+    // stdout is still pure, valid JSON (banner/chatter stays on stderr) — parse it
+    // and check the specific field the issue reported, not just a substring.
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must parse as JSON");
+    let file = report["by_file"][0]["file"].as_str().unwrap();
+    assert!(
+        !file.contains("SRV-PROD-CRM01") && !file.contains("vm-finance-db"),
+        "by_file[].file must be anonymized. Got: {}",
+        file
+    );
+    assert!(
+        file.starts_with("host-") && file.ends_with(".log"),
+        "recognizable prefix/extension survive, only the entity is replaced. Got: {}",
+        file
+    );
+}
+
+#[test]
+fn validate_only_report_source_path_anonymized() {
+    let root = TempDir::new().unwrap();
+    let list_dir = TempDir::new().unwrap();
+    let host_list = list_dir.path().join("hosts.txt");
+    fs::write(&host_list, "SRV-PROD-CRM01\n").unwrap();
+
+    // The scanned directory itself (`-d`), not just an entry under it, is named
+    // after the hostname.
+    let input_dir = root.path().join("SRV-PROD-CRM01");
+    fs::create_dir_all(&input_dir).unwrap();
+    fs::write(input_dir.join("t.log"), "ordinary log line\n").unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.to_str().unwrap(),
+        "--validate-only",
+        "--hostname-list",
+        host_list.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must parse as JSON");
+    let source = report["source"].as_str().unwrap();
+    assert!(
+        !source.contains("SRV-PROD-CRM01"),
+        "`source` must not leak the scanned directory's own name. Got: {}",
+        source
+    );
+}
+
+#[test]
+fn validate_only_report_ip_in_path_rendered_path_safe() {
+    let input_dir = TempDir::new().unwrap();
+    let ip_dir = input_dir.path().join("Console").join("10.0.0.21");
+    fs::create_dir_all(&ip_dir).unwrap();
+    fs::write(ip_dir.join("task.log"), "target 10.0.0.21 reached\n").unwrap();
+
+    let out = run(&["-d", input_dir.path().to_str().unwrap(), "--validate-only"]);
+    assert_eq!(out.status.code(), Some(2));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("10.0.0.21"),
+        "raw IP must not appear in the report. Got: {}",
+        stdout
+    );
+    // Same filesystem-safe mask a real output tree's directory name would get
+    // (`*` is illegal in a Windows path component), so a reader correlating the
+    // report against an anonymized output directory sees matching names.
+    assert!(
+        stdout.contains("xx.xx.0.21"),
+        "IP directory should render path-safe the same way a real output tree would. Got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn validate_only_report_ignores_keep_path_names() {
+    let input_dir = TempDir::new().unwrap();
+    let list_dir = TempDir::new().unwrap();
+    let host_list = list_dir.path().join("hosts.txt");
+    fs::write(&host_list, "SRV-PROD-CRM01\n").unwrap();
+    fs::write(
+        input_dir.path().join("Task.SRV-PROD-CRM01.log"),
+        "job ran\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "--validate-only",
+        "--hostname-list",
+        host_list.to_str().unwrap(),
+        "--keep-path-names",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("SRV-PROD-CRM01"),
+        "--keep-path-names must not defeat report path anonymization. Got: {}",
+        stdout
+    );
+    let _: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must parse as JSON despite the flag combo");
+
+    // The deviation from --keep-path-names' normal effect is explained, not silent.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--keep-path-names has no effect on the --validate-only report"),
+        "must explain why the flag is not honored here. stderr: {}",
+        stderr
+    );
+}
+
 // ── v2.6: .zip input ────────────────────────────────────────────────
 
 #[test]
@@ -2444,4 +2605,656 @@ fn same_account_consistent_across_log_and_trace() {
         trace_input,
         "round trip through the dictionary must restore b.trace's original bytes"
     );
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Zip-slip: hostile entry names in an untrusted bundle
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Write a zip with entry names exactly as given, bypassing any normalisation
+/// `make_zip` might apply — the whole point here is to produce names a well-behaved
+/// writer would refuse.
+fn make_zip_raw(path: &Path, entries: &[(&str, &str)]) {
+    use std::io::Write;
+    let file = fs::File::create(path).unwrap();
+    let mut zw = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, content) in entries {
+        zw.start_file(*name, opts).unwrap();
+        zw.write_all(content.as_bytes()).unwrap();
+    }
+    zw.finish().unwrap();
+}
+
+/// A `.zip` bundle is untrusted input — it arrives from a customer. An entry named
+/// `../../x` used to be joined straight onto the output root, landing outside the
+/// directory the operator named, with exit code 0 and no mention in the listing.
+#[test]
+fn zip_traversal_entry_stays_inside_output_dir() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("evil.zip");
+    let out = dir.path().join("a/b/out");
+    fs::create_dir_all(&out).unwrap();
+    make_zip_raw(
+        &in_zip,
+        &[
+            ("good/Svc.log", "legit admin@corp.com 10.1.1.1\n"),
+            ("../../ESCAPED.log", "escaped erin@corp.com 10.2.2.2\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // Nothing may exist above the output directory.
+    for stray in ["a/ESCAPED.log", "a/b/ESCAPED.log", "ESCAPED.log"] {
+        assert!(
+            !dir.path().join(stray).exists(),
+            "{stray} was written outside -o"
+        );
+    }
+    // The content is still anonymized and still delivered, just contained.
+    let names = rel_paths(&out);
+    assert!(
+        names.iter().any(|n| n.ends_with("ESCAPED.log")),
+        "the entry should be kept inside -o, not dropped: {names:?}"
+    );
+    for p in collect_files(&out) {
+        let c = fs::read_to_string(&p).unwrap();
+        assert!(
+            !c.contains("@corp.com") && !c.contains("10.1.1.1") && !c.contains("10.2.2.2"),
+            "{} not anonymized: {c}",
+            p.display()
+        );
+    }
+    // And the operator is told, rather than it being fixed in silence.
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("had a name that points outside the output")
+            && stderr.contains("../../ESCAPED.log"),
+        "rewritten entries must be reported by name. stderr: {stderr}"
+    );
+}
+
+/// Repacking a traversal name unchanged hands the attack downstream: the archive
+/// sent to support would itself write outside wherever the recipient extracts it.
+#[test]
+fn repacked_zip_carries_no_traversal_entry() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("evil.zip");
+    let out_zip = dir.path().join("anon.zip");
+    make_zip_raw(
+        &in_zip,
+        &[
+            ("good/Svc.log", "legit admin@corp.com\n"),
+            ("../../ESCAPED.log", "escaped erin@corp.com\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    for (name, _) in read_zip(&out_zip) {
+        assert!(
+            !name.contains(".."),
+            "traversal entry repacked into the output archive: {name}"
+        );
+        assert!(
+            !name.starts_with('/'),
+            "absolute entry repacked into the output archive: {name}"
+        );
+    }
+}
+
+/// Absolute and Windows drive-letter names escape just as effectively as `../..` —
+/// `Path::join` discards the root it was given for both.
+#[test]
+fn zip_absolute_and_drive_letter_entries_are_contained() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("evil.zip");
+    let out = dir.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    make_zip_raw(
+        &in_zip,
+        &[
+            ("/tmp/ABS.log", "abs dave@corp.com\n"),
+            ("C:/Windows/DRIVE.log", "drive carol@corp.com\n"),
+            ("ok/Fine.log", "fine bob@corp.com\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    for p in collect_files(&out) {
+        assert!(
+            p.starts_with(&out),
+            "{} escaped the output directory",
+            p.display()
+        );
+    }
+    assert!(
+        !Path::new("/tmp/ABS.log").exists(),
+        "absolute entry was written to /tmp"
+    );
+}
+
+/// A bundle with ordinary entry names must be completely unaffected by the
+/// sanitising — same tree, same contents, and no warning.
+#[test]
+fn ordinary_zip_unaffected_by_path_sanitising() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("bundle.zip");
+    let out_zip = dir.path().join("anon.zip");
+    make_zip(
+        &in_zip,
+        &[
+            ("Svc.log", "admin@corp.com\n"),
+            ("sub/dir/Proxy.trace", "{\"m\":\"erin@corp.com\"}\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--keep-path-names",
+    ]);
+    assert!(o.status.success());
+    let names: Vec<String> = read_zip(&out_zip).into_iter().map(|(n, _)| n).collect();
+    assert!(names.contains(&"Svc.log".to_string()), "got {names:?}");
+    assert!(
+        names.contains(&"sub/dir/Proxy.trace".to_string()),
+        "nested path must be preserved verbatim: {names:?}"
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !stderr.contains("had a name that points outside the output"),
+        "a clean bundle must not trigger the warning. stderr: {stderr}"
+    );
+}
+
+// ── Issue #12: IPv4 collision must not abort the whole reverse run ─────
+
+/// The exact scenario from issue #12: a proxy on 192.168.1.10 and a repo on
+/// 10.0.1.10 share their last two octets, so IPv4 masking (last-two-octets-only,
+/// by design — see README) sends both to `**.**.1.10`. Before this fix,
+/// `reverse_anonymize` treated that expected collision as dictionary corruption
+/// and `bail!`ed before restoring anything — not even `CORP\jdoe` and
+/// `Job-CRM.vbk`, which live in the same file and are perfectly reversible.
+/// This asserts the run now succeeds, the reversible entities come back
+/// byte-for-byte, and the operator is told which value could not be resolved
+/// and why.
+#[test]
+fn reverse_survives_ipv4_collision_and_restores_the_rest() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let back = TempDir::new().unwrap();
+    let dict = TempDir::new().unwrap();
+
+    let original = "proxy 192.168.1.10 talks to repo 10.0.1.10 / CORP\\jdoe opened Job-CRM.vbk\n";
+    fs::write(src.path().join("a.log"), original).unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "-D",
+        "--dict-output",
+        dict.path().to_str().unwrap(),
+    ]);
+    assert!(
+        o.status.success(),
+        "forward stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let anonymized = fs::read_to_string(out.path().join("a.log")).unwrap();
+    assert!(
+        anonymized.contains("**.**.1.10"),
+        "both colliding addresses must mask to the same last-two-octets string. Got: {anonymized}"
+    );
+    assert!(
+        !anonymized.contains("192.168.1.10") && !anonymized.contains("10.0.1.10"),
+        "originals must not leak in the anonymized output. Got: {anonymized}"
+    );
+
+    let dict_file = collect_files(dict.path())
+        .into_iter()
+        .find(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+        .expect("dictionary not written");
+
+    // Before the fix: this call failed and wrote nothing at all.
+    let o = run(&[
+        "--reverse",
+        dict_file.to_str().unwrap(),
+        "-d",
+        out.path().to_str().unwrap(),
+        "-o",
+        back.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        o.status.success(),
+        "reverse must succeed despite the IPv4 collision. stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let restored_path = back.path().join("a.log");
+    assert!(
+        restored_path.exists(),
+        "reverse must still produce output for the file. Got: {:?}",
+        rel_paths(back.path())
+    );
+    let restored = fs::read_to_string(&restored_path).unwrap();
+
+    // The reversible entities in the same file come back exactly.
+    assert!(
+        restored.contains("CORP\\jdoe"),
+        "domain user in the same file must be restored. Got: {restored}"
+    );
+    assert!(
+        restored.contains("Job-CRM.vbk"),
+        "backup file name in the same file must be restored. Got: {restored}"
+    );
+
+    // The ambiguous IPv4 pair cannot be told apart, so it is left as the mask
+    // rather than guessed at — neither original reappears, and the mask itself
+    // is still present.
+    assert!(
+        !restored.contains("192.168.1.10") && !restored.contains("10.0.1.10"),
+        "an ambiguous IPv4 mask must not be resolved to either candidate original. Got: {restored}"
+    );
+    assert!(
+        restored.contains("**.**.1.10"),
+        "the unresolved mask must be left as-is. Got: {restored}"
+    );
+
+    // The operator must be told clearly which value could not be restored,
+    // and why — silence here would be worse than the old hard abort.
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("cannot be reversed") && stderr.contains("**.**.1.10"),
+        "stderr must name the unresolved value. stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("192.168.1.10") && stderr.contains("10.0.1.10"),
+        "stderr must list both candidate originals. stderr: {stderr}"
+    );
+}
+
+/// A dictionary is genuinely corrupt — not just recording an expected IPv4
+/// collision — when a *collision-checked* section (here: domain_users, guarded
+/// by `used_user_pairs` in build_map) contains two different originals mapped
+/// to the same anonymized value. That can only happen if the JSON was
+/// hand-edited, merged, or otherwise tampered with after export, and the fix
+/// for issue #12 must not weaken this into silence: it should still abort.
+#[test]
+fn reverse_still_rejects_genuine_corruption_outside_ipv4() {
+    let out = TempDir::new().unwrap();
+    let back = TempDir::new().unwrap();
+    let dict_dir = TempDir::new().unwrap();
+
+    fs::write(out.path().join("a.log"), "irrelevant content\n").unwrap();
+
+    // domain_users is collision-checked at generation time, so two distinct
+    // originals sharing an anonymized value here is not something a real
+    // forward run could ever produce — a hand-tampered dictionary is the only
+    // explanation.
+    let corrupt_dict = r#"{
+        "metadata": {
+            "version": "2.7.1",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "files_processed": 1,
+            "total_entities": 2
+        },
+        "mappings": {
+            "domain_users": [
+                {"original": "CORP\\alice", "anonymized": "ZZZZ\\wwww"},
+                {"original": "CORP\\bob", "anonymized": "ZZZZ\\wwww"}
+            ]
+        }
+    }"#;
+    let dict_path = dict_dir.path().join("tampered.json");
+    fs::write(&dict_path, corrupt_dict).unwrap();
+
+    let o = run(&[
+        "--reverse",
+        dict_path.to_str().unwrap(),
+        "-d",
+        out.path().to_str().unwrap(),
+        "-o",
+        back.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        !o.status.success(),
+        "a genuinely ambiguous non-IPv4 mapping must still abort the run"
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("Dictionary corruption"),
+        "stderr must still call this out as corruption. stderr: {stderr}"
+    );
+    assert!(
+        rel_paths(back.path()).is_empty(),
+        "nothing should be written once genuine corruption is detected"
+    );
+}
+
+/// Real bundles carry directory entries (`Svc/`) and `./` prefixes. Those are
+/// spelling, not escapes — reporting them fires the hostile-bundle warning on
+/// essentially every archive produced by `zip -r`, which buries the real signal.
+/// `make_zip` only ever calls `start_file`, so a fixture built with it cannot
+/// catch this; this one adds directory entries explicitly.
+#[test]
+fn ordinary_zip_with_directory_entries_raises_no_warning() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("bundle.zip");
+    let out_zip = dir.path().join("anon.zip");
+    {
+        use std::io::Write;
+        let file = fs::File::create(&in_zip).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.add_directory("Svc/", opts).unwrap();
+        zw.start_file("Svc/a.log", opts).unwrap();
+        zw.write_all(b"a admin@corp.com\n").unwrap();
+        zw.add_directory("Svc/Util/", opts).unwrap();
+        zw.start_file("Svc/Util/b.log", opts).unwrap();
+        zw.write_all(b"b bob@corp.com\n").unwrap();
+        zw.start_file("./c.log", opts).unwrap();
+        zw.write_all(b"c carol@corp.com\n").unwrap();
+        zw.finish().unwrap();
+    }
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--keep-path-names",
+    ]);
+    assert!(o.status.success());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !stderr.contains("had a name that points outside the output"),
+        "directory entries and ./ prefixes are not escapes. stderr: {stderr}"
+    );
+    let names: Vec<String> = read_zip(&out_zip).into_iter().map(|(n, _)| n).collect();
+    assert!(
+        names.contains(&"Svc/Util/b.log".to_string()),
+        "nested entry must survive: {names:?}"
+    );
+}
+
+/// Stripping traversal collapses distinct entries onto one name. Overwriting one
+/// of them loses anonymized content that was meant to be delivered; letting the
+/// zip writer reject the duplicate aborts the run with a partial archive on disk.
+/// Both are worse than a suffix.
+#[test]
+fn colliding_sanitised_names_keep_every_entry() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("col.zip");
+    make_zip_raw(
+        &in_zip,
+        &[
+            ("dup.log", "one admin@corp.com\n"),
+            ("../dup.log", "two erin@corp.com\n"),
+            ("./dup.log", "three carol@corp.com\n"),
+            ("keep.log", "four bob@corp.com\n"),
+        ],
+    );
+
+    // Repack: every entry present, unique names, run succeeds.
+    let out_zip = dir.path().join("anon.zip");
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "collision must not abort the run. stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let entries = read_zip(&out_zip);
+    assert_eq!(entries.len(), 4, "every entry must survive: {entries:?}");
+    let mut names: Vec<&String> = entries.iter().map(|(n, _)| n).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 4, "names must be unique: {names:?}");
+
+    // Extract: same, on disk.
+    let out_dir = TempDir::new().unwrap();
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "-o",
+        out_dir.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(o.status.success());
+    let files = collect_files(out_dir.path());
+    assert_eq!(
+        files.len(),
+        4,
+        "no entry may be silently overwritten: {files:?}"
+    );
+    // The four distinct payloads are all still there, none clobbered.
+    let bodies: Vec<String> = files
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap_or_default())
+        .collect();
+    for marker in ["one", "two", "three", "four"] {
+        assert!(
+            bodies.iter().any(|b| b.starts_with(marker)),
+            "{marker} lost to a collision; got {bodies:?}"
+        );
+    }
+}
+
+/// A dictionary exported twice, or concatenated with itself, repeats entries that
+/// carry the *same* original. That says exactly one thing about the value, so it
+/// must still reverse — only genuinely competing originals are ambiguous.
+#[test]
+fn repeated_identical_ipv4_entry_still_reverses() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("out");
+    let back = dir.path().join("back");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("a.log"), "host at **.**.30.40 done\n").unwrap();
+    let dict = dir.path().join("d.json");
+    fs::write(
+        &dict,
+        r#"{"metadata":{"version":"2.7.2","created_at":"2026-08-08T00:00:00Z","files_processed":1,"total_entities":2},
+            "mappings":{"ip_addresses":[
+              {"original":"10.20.30.40","anonymized":"**.**.30.40"},
+              {"original":"10.20.30.40","anonymized":"**.**.30.40"}]}}"#,
+    )
+    .unwrap();
+
+    let o = run(&[
+        "--reverse",
+        dict.to_str().unwrap(),
+        "-d",
+        out.to_str().unwrap(),
+        "-o",
+        back.to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !stderr.contains("could be any of"),
+        "an entry repeated identically is not ambiguous. stderr: {stderr}"
+    );
+    let restored = fs::read_to_string(back.join("a.log")).unwrap();
+    assert!(
+        restored.contains("10.20.30.40"),
+        "should have been restored: {restored}"
+    );
+}
+
+/// Two entries can want the same destination without anything hostile going on:
+/// the filesystem-safe IP rendering is lossy, so `Agent.10.0.1.21.log` and
+/// `Agent.192.168.1.21.log` both become `Agent.xx.xx.1.21.log`. Telling the
+/// operator their bundle is untrusted for that would be the same false alarm the
+/// escape reporting was rewritten to avoid.
+#[test]
+fn benign_collision_is_not_reported_as_hostile() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("b.zip");
+    let out = TempDir::new().unwrap();
+    make_zip_raw(
+        &in_zip,
+        &[
+            ("Agent.10.0.1.21.log", "a admin@corp.com 10.0.1.21\n"),
+            ("Agent.192.168.1.21.log", "b bob@corp.com 192.168.1.21\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(o.status.success());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("wanted a destination already taken"),
+        "the collision must be reported. stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("points outside the output")
+            && !stderr.contains("Treat this bundle as malformed or hostile"),
+        "an ordinary bundle must not be reported as an escape. stderr: {stderr}"
+    );
+    assert_eq!(
+        collect_files(out.path()).len(),
+        2,
+        "v2.7.1 lost one of these; both must survive"
+    );
+}
+
+/// `C:REL.log` is drive-*relative* — it carries no separator, so splitting never
+/// isolates the prefix. On Windows `PathBuf::push` replaces the root for a path
+/// with a prefix, so it escapes just as `../..` does.
+#[test]
+fn drive_relative_entry_is_contained_and_reported() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("d.zip");
+    let out_zip = dir.path().join("o.zip");
+    make_zip_raw(&in_zip, &[("C:REL.log", "x erin@corp.com\n")]);
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(o.status.success());
+    let names: Vec<String> = read_zip(&out_zip).into_iter().map(|(n, _)| n).collect();
+    assert!(
+        names.contains(&"REL.log".to_string()),
+        "drive prefix must be stripped, keeping the name it qualified: {names:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("points outside the output"),
+        "a drive-relative name is an escape and must be reported"
+    );
+}
+
+/// A nested archive holding both `dup.log` and `../dup.log` used to abort the whole
+/// staging run and write nothing — the same failure removed from the two output
+/// writers, left behind in the third consumer of entry names.
+#[test]
+fn expand_archives_survives_colliding_nested_entries() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    make_zip_raw(
+        &src.path().join("Inner.zip"),
+        &[
+            ("dup.log", "one admin@corp.com\n"),
+            ("../dup.log", "two erin@corp.com\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--expand-archives",
+    ]);
+    assert!(
+        o.status.success(),
+        "a colliding nested archive must not kill the run. stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let bodies: Vec<String> = collect_files(out.path())
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap_or_default())
+        .collect();
+    for marker in ["one", "two"] {
+        assert!(
+            bodies.iter().any(|b| b.starts_with(marker)),
+            "{marker} lost; got {bodies:?}"
+        );
+    }
 }

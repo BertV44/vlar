@@ -110,6 +110,96 @@ left `--paranoid` reporting phantom leaks. Single-backslash escapes (`\b \f \n \
 no longer treated as `DOMAIN\user` in JSON-encoded content. Plain-text `.log` detection is
 unchanged.
 
+## What's new in v2.7.2
+
+Three defects found by a QA pass over the whole tool. All three predate v2.7.
+
+### Hostile `.zip` entry names no longer escape the output (#10)
+
+A support bundle is untrusted input — it arrives from a customer by mail or upload — and entry
+names were joined onto the output path without sanitising. An entry named `../../ESCAPED.log`
+landed **two levels above** the directory given to `-o`, with exit code 0 and no mention in the
+output listing. `--output-zip` repacked the traversal name verbatim, so the archive you send to
+support was itself a zip-slip archive aimed at whoever extracts it.
+
+Both writers now reduce every destination to a safe relative path, covering `../`, absolute names
+and Windows drive/UNC shapes. Entries are **contained rather than discarded** — the content is
+still anonymized and still delivered — and every rewrite is reported:
+
+```
+  ⚠ 2 zip entr(ies) could not be written under their own name:
+      ../../ESCAPED.log  ->  ESCAPED.log
+      /tmp/ABS.log  ->  tmp/ABS.log
+    Entry names come from the input archive, which is untrusted: an entry named
+    `../../x` would otherwise land outside -o and be repacked into the archive
+    you send on. Names that collide once made relative get a numeric suffix so
+    no entry is lost. The content itself was anonymized as usual.
+```
+
+Silently fixing a hostile bundle would deny you the only signal that you received one — so that
+warning has to stay meaningful. It fires only on a name that genuinely escapes: a leading `/`, a
+`..` segment, or a Windows drive prefix. A trailing `/` on a directory entry and a `./` prefix are
+normalisation, not escapes, and stay quiet; otherwise every archive produced by `zip -r` would
+trip it and the signal would be worthless. An entry whose name reduces to nothing (`../..`) is
+dropped and listed as such.
+
+**Colliding destinations are a separate, benign case, and get their own message.** Two entries can
+want the same name without anything hostile going on — most often because the filesystem-safe IP
+rendering is lossy, so `Agent.10.0.1.21.log` and `Agent.192.168.1.21.log` both become
+`Agent.xx.xx.1.21.log`. That is an ordinary bundle, and telling you it is untrusted would be a
+false alarm:
+
+```
+  ⚠ 1 zip entr(ies) wanted a destination already taken, and were renamed:
+      Agent.xx.xx.1.21.log  ->  Agent.xx.xx.1.21-1.log
+    Nothing hostile about this on its own — the filesystem-safe IP rendering
+    is lossy, so two addresses sharing their last two octets give one name.
+    A numeric suffix keeps both. The content itself was anonymized as usual.
+```
+
+This case is worth calling out because v2.7.1 handled it badly on perfectly normal input:
+`--output-zip` aborted with `Duplicate filename` and produced nothing, while `-o` silently
+overwrote one file and exited 0. Both entries now survive, in every mode — including entries
+expanded from a nested archive under `--expand-archives`.
+
+Both messages are printed even when the run later fails part-way through, so an error on a corrupt
+entry no longer hides the fact that the same archive also carried traversal names — which matters
+in extract mode, where those files are already on disk by then.
+
+### `--validate-only` no longer leaks names through file paths (#11)
+
+The report documents "counts by entity kind and by file — never the original values", but
+`by_file[].file` and `source` were the raw paths, which carry hostnames, VM names and job names.
+This is the output most likely to leave the machine, since it exists to be piped into `jq` and
+automation. Both fields now go through the same mapping the normal output tree uses, so IP/MAC
+keep their documented `10.0.0.21` → `xx.xx.0.21` rendering.
+
+The report ignores `--keep-path-names` deliberately: that flag opts a human out of renaming in an
+output tree they inspect before sharing, and the report has no such inspection step. Combining the
+two prints an explanatory note on stderr. stdout stays pure JSON.
+
+### `--reverse` no longer aborts on a one-way IPv4 mask collision (#12)
+
+IPv4 masking keeps only the last two octets and is deliberately one-way, but it was the only
+entity kind with no collision guard. A proxy on `192.168.1.10` and a repository on `10.0.1.10` —
+an ordinary addressing convention — both mask to `**.**.1.10`, and the reverse path treated that
+as dictionary corruption and refused to run at all. **Nothing** was restored, including entities
+in the same file that were perfectly reversible.
+
+The check now separates the two cases it was conflating. A duplicate confined to IPv4 is expected,
+since that mapping is many-to-one by design: those entries are left masked rather than guessed,
+and named in a warning with every candidate original. A duplicate touching a collision-checked
+kind can only come from a tampered dictionary, and still aborts.
+
+```
+  ⚠ 1 anonymized value(s) cannot be reversed — IPv4 masking keeps only the last two octets, so distinct addresses that share them produce the same masked string:
+    **.**.1.10 <- could be any of: 10.0.1.10, 192.168.1.10
+    Left as-is in the restored output. Everything else — including other entities in the same files — is restored normally.
+```
+
+Repeated entries carrying the same original — a dictionary exported twice, or concatenated — are
+not ambiguous and reverse normally. The mask format in anonymized output is unchanged.
+
 ## What's new in v2.7.1
 
 ### `DOMAIN\user` is now detected in JSON-encoded traces
