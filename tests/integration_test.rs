@@ -1500,6 +1500,167 @@ fn validate_only_report_output_to_file() {
     assert!(report_json.contains("\"mode\": \"validate-only\""));
 }
 
+// ── issue #11: --validate-only report must not leak names via paths ──
+
+#[test]
+fn validate_only_report_anonymizes_hostname_and_object_in_path() {
+    let input_dir = TempDir::new().unwrap();
+    let list_dir = TempDir::new().unwrap();
+    let host_list = list_dir.path().join("hosts.txt");
+    let obj_list = list_dir.path().join("objects.txt");
+    fs::write(&host_list, "SRV-PROD-CRM01\n").unwrap();
+    fs::write(&obj_list, "vm-finance-db\n").unwrap();
+
+    // Same shape as the issue's reproduction: hostname as a directory name, VM
+    // name embedded in the file name. Content carries an auto-detected entity
+    // (an IP) too — kind_counts() treats hostname/object as list-injected/global
+    // rather than per-file, so a file with nothing auto-detected in its content
+    // never gets a `by_file` entry at all; the content entity is what makes this
+    // file (and therefore its path) show up in `by_file` to begin with.
+    let sub = input_dir.path().join("SRV-PROD-CRM01");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(
+        sub.join("Task.SRV-PROD-CRM01-vm-finance-db.log"),
+        "backup job ran, target 192.168.1.50\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "--validate-only",
+        "--hostname-list",
+        host_list.to_str().unwrap(),
+        "--object-list",
+        obj_list.to_str().unwrap(),
+    ]);
+
+    // Detected via the explicit lists, same deterministic exit code as any other run.
+    assert_eq!(out.status.code(), Some(2));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("SRV-PROD-CRM01") && !stdout.contains("vm-finance-db"),
+        "hostname/VM name must not appear verbatim anywhere in the report. Got: {}",
+        stdout
+    );
+
+    // stdout is still pure, valid JSON (banner/chatter stays on stderr) — parse it
+    // and check the specific field the issue reported, not just a substring.
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must parse as JSON");
+    let file = report["by_file"][0]["file"].as_str().unwrap();
+    assert!(
+        !file.contains("SRV-PROD-CRM01") && !file.contains("vm-finance-db"),
+        "by_file[].file must be anonymized. Got: {}",
+        file
+    );
+    assert!(
+        file.starts_with("host-") && file.ends_with(".log"),
+        "recognizable prefix/extension survive, only the entity is replaced. Got: {}",
+        file
+    );
+}
+
+#[test]
+fn validate_only_report_source_path_anonymized() {
+    let root = TempDir::new().unwrap();
+    let list_dir = TempDir::new().unwrap();
+    let host_list = list_dir.path().join("hosts.txt");
+    fs::write(&host_list, "SRV-PROD-CRM01\n").unwrap();
+
+    // The scanned directory itself (`-d`), not just an entry under it, is named
+    // after the hostname.
+    let input_dir = root.path().join("SRV-PROD-CRM01");
+    fs::create_dir_all(&input_dir).unwrap();
+    fs::write(input_dir.join("t.log"), "ordinary log line\n").unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.to_str().unwrap(),
+        "--validate-only",
+        "--hostname-list",
+        host_list.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must parse as JSON");
+    let source = report["source"].as_str().unwrap();
+    assert!(
+        !source.contains("SRV-PROD-CRM01"),
+        "`source` must not leak the scanned directory's own name. Got: {}",
+        source
+    );
+}
+
+#[test]
+fn validate_only_report_ip_in_path_rendered_path_safe() {
+    let input_dir = TempDir::new().unwrap();
+    let ip_dir = input_dir.path().join("Console").join("10.0.0.21");
+    fs::create_dir_all(&ip_dir).unwrap();
+    fs::write(ip_dir.join("task.log"), "target 10.0.0.21 reached\n").unwrap();
+
+    let out = run(&["-d", input_dir.path().to_str().unwrap(), "--validate-only"]);
+    assert_eq!(out.status.code(), Some(2));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("10.0.0.21"),
+        "raw IP must not appear in the report. Got: {}",
+        stdout
+    );
+    // Same filesystem-safe mask a real output tree's directory name would get
+    // (`*` is illegal in a Windows path component), so a reader correlating the
+    // report against an anonymized output directory sees matching names.
+    assert!(
+        stdout.contains("xx.xx.0.21"),
+        "IP directory should render path-safe the same way a real output tree would. Got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn validate_only_report_ignores_keep_path_names() {
+    let input_dir = TempDir::new().unwrap();
+    let list_dir = TempDir::new().unwrap();
+    let host_list = list_dir.path().join("hosts.txt");
+    fs::write(&host_list, "SRV-PROD-CRM01\n").unwrap();
+    fs::write(
+        input_dir.path().join("Task.SRV-PROD-CRM01.log"),
+        "job ran\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "--validate-only",
+        "--hostname-list",
+        host_list.to_str().unwrap(),
+        "--keep-path-names",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("SRV-PROD-CRM01"),
+        "--keep-path-names must not defeat report path anonymization. Got: {}",
+        stdout
+    );
+    let _: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must parse as JSON despite the flag combo");
+
+    // The deviation from --keep-path-names' normal effect is explained, not silent.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--keep-path-names has no effect on the --validate-only report"),
+        "must explain why the flag is not honored here. stderr: {}",
+        stderr
+    );
+}
+
 // ── v2.6: .zip input ────────────────────────────────────────────────
 
 #[test]
