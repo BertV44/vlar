@@ -2808,3 +2808,173 @@ fn ordinary_zip_unaffected_by_path_sanitising() {
         "a clean bundle must not trigger the warning. stderr: {stderr}"
     );
 }
+
+// ── Issue #12: IPv4 collision must not abort the whole reverse run ─────
+
+/// The exact scenario from issue #12: a proxy on 192.168.1.10 and a repo on
+/// 10.0.1.10 share their last two octets, so IPv4 masking (last-two-octets-only,
+/// by design — see README) sends both to `**.**.1.10`. Before this fix,
+/// `reverse_anonymize` treated that expected collision as dictionary corruption
+/// and `bail!`ed before restoring anything — not even `CORP\jdoe` and
+/// `Job-CRM.vbk`, which live in the same file and are perfectly reversible.
+/// This asserts the run now succeeds, the reversible entities come back
+/// byte-for-byte, and the operator is told which value could not be resolved
+/// and why.
+#[test]
+fn reverse_survives_ipv4_collision_and_restores_the_rest() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let back = TempDir::new().unwrap();
+    let dict = TempDir::new().unwrap();
+
+    let original = "proxy 192.168.1.10 talks to repo 10.0.1.10 / CORP\\jdoe opened Job-CRM.vbk\n";
+    fs::write(src.path().join("a.log"), original).unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "-D",
+        "--dict-output",
+        dict.path().to_str().unwrap(),
+    ]);
+    assert!(
+        o.status.success(),
+        "forward stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let anonymized = fs::read_to_string(out.path().join("a.log")).unwrap();
+    assert!(
+        anonymized.contains("**.**.1.10"),
+        "both colliding addresses must mask to the same last-two-octets string. Got: {anonymized}"
+    );
+    assert!(
+        !anonymized.contains("192.168.1.10") && !anonymized.contains("10.0.1.10"),
+        "originals must not leak in the anonymized output. Got: {anonymized}"
+    );
+
+    let dict_file = collect_files(dict.path())
+        .into_iter()
+        .find(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+        .expect("dictionary not written");
+
+    // Before the fix: this call failed and wrote nothing at all.
+    let o = run(&[
+        "--reverse",
+        dict_file.to_str().unwrap(),
+        "-d",
+        out.path().to_str().unwrap(),
+        "-o",
+        back.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        o.status.success(),
+        "reverse must succeed despite the IPv4 collision. stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let restored_path = back.path().join("a.log");
+    assert!(
+        restored_path.exists(),
+        "reverse must still produce output for the file. Got: {:?}",
+        rel_paths(back.path())
+    );
+    let restored = fs::read_to_string(&restored_path).unwrap();
+
+    // The reversible entities in the same file come back exactly.
+    assert!(
+        restored.contains("CORP\\jdoe"),
+        "domain user in the same file must be restored. Got: {restored}"
+    );
+    assert!(
+        restored.contains("Job-CRM.vbk"),
+        "backup file name in the same file must be restored. Got: {restored}"
+    );
+
+    // The ambiguous IPv4 pair cannot be told apart, so it is left as the mask
+    // rather than guessed at — neither original reappears, and the mask itself
+    // is still present.
+    assert!(
+        !restored.contains("192.168.1.10") && !restored.contains("10.0.1.10"),
+        "an ambiguous IPv4 mask must not be resolved to either candidate original. Got: {restored}"
+    );
+    assert!(
+        restored.contains("**.**.1.10"),
+        "the unresolved mask must be left as-is. Got: {restored}"
+    );
+
+    // The operator must be told clearly which value could not be restored,
+    // and why — silence here would be worse than the old hard abort.
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("cannot be reversed") && stderr.contains("**.**.1.10"),
+        "stderr must name the unresolved value. stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("192.168.1.10") && stderr.contains("10.0.1.10"),
+        "stderr must list both candidate originals. stderr: {stderr}"
+    );
+}
+
+/// A dictionary is genuinely corrupt — not just recording an expected IPv4
+/// collision — when a *collision-checked* section (here: domain_users, guarded
+/// by `used_user_pairs` in build_map) contains two different originals mapped
+/// to the same anonymized value. That can only happen if the JSON was
+/// hand-edited, merged, or otherwise tampered with after export, and the fix
+/// for issue #12 must not weaken this into silence: it should still abort.
+#[test]
+fn reverse_still_rejects_genuine_corruption_outside_ipv4() {
+    let out = TempDir::new().unwrap();
+    let back = TempDir::new().unwrap();
+    let dict_dir = TempDir::new().unwrap();
+
+    fs::write(out.path().join("a.log"), "irrelevant content\n").unwrap();
+
+    // domain_users is collision-checked at generation time, so two distinct
+    // originals sharing an anonymized value here is not something a real
+    // forward run could ever produce — a hand-tampered dictionary is the only
+    // explanation.
+    let corrupt_dict = r#"{
+        "metadata": {
+            "version": "2.7.1",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "files_processed": 1,
+            "total_entities": 2
+        },
+        "mappings": {
+            "domain_users": [
+                {"original": "CORP\\alice", "anonymized": "ZZZZ\\wwww"},
+                {"original": "CORP\\bob", "anonymized": "ZZZZ\\wwww"}
+            ]
+        }
+    }"#;
+    let dict_path = dict_dir.path().join("tampered.json");
+    fs::write(&dict_path, corrupt_dict).unwrap();
+
+    let o = run(&[
+        "--reverse",
+        dict_path.to_str().unwrap(),
+        "-d",
+        out.path().to_str().unwrap(),
+        "-o",
+        back.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        !o.status.success(),
+        "a genuinely ambiguous non-IPv4 mapping must still abort the run"
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("Dictionary corruption"),
+        "stderr must still call this out as corruption. stderr: {stderr}"
+    );
+    assert!(
+        rel_paths(back.path()).is_empty(),
+        "nothing should be written once genuine corruption is detected"
+    );
+}

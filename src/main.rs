@@ -3146,50 +3146,118 @@ fn reverse_anonymize(dict_path: &Path, input_files: &[PathBuf], cli: &Cli) -> Re
         );
     }
 
-    // Build reverse mapping: anonymized -> original
-    let mut reverse_pairs: Vec<(String, String)> = Vec::with_capacity(actual_count);
-
-    let sections: &[&Vec<DictEntry>] = &[
-        &dict.mappings.emails,
-        &dict.mappings.domains,
-        &dict.mappings.domain_users,
-        &dict.mappings.ip_addresses,
-        &dict.mappings.naked_users,
-        &dict.mappings.fqdns,
-        &dict.mappings.ipv6_addresses,
-        &dict.mappings.mac_addresses,
-        &dict.mappings.ssh_fps,
-        &dict.mappings.backup_files,
-        &dict.mappings.hostnames,
-        &dict.mappings.objects,
-        &dict.mappings.dbs,
+    // Build reverse mapping: anonymized -> original.
+    //
+    // Every section here is collision-checked at generation time EXCEPT
+    // ip_addresses: IPv4 masking keeps only the last two octets (see
+    // `anonymize_ip` / build_map STEP 4), so a proxy on 192.168.x.y and a
+    // repository on 10.a.x.y that merely share a host number — an ordinary
+    // addressing convention — land on the same masked string, with no
+    // `used_*` set to catch it the way the IPv6/MAC steps right below it do.
+    // That is a deliberate trade-off (the mask stays subnet-local and
+    // human-readable; it was never meant to double as a lossless
+    // identifier — see the README) and not a bug in the mapping itself.
+    // The bug was in what came next: treating the resulting duplicate the
+    // same as a tampered dictionary and aborting the whole run over it. The
+    // `is_lossy` flag carried alongside each candidate below is how the
+    // ambiguity check tells those two situations apart.
+    let sections: &[(&Vec<DictEntry>, bool)] = &[
+        (&dict.mappings.emails, false),
+        (&dict.mappings.domains, false),
+        (&dict.mappings.domain_users, false),
+        (&dict.mappings.ip_addresses, true),
+        (&dict.mappings.naked_users, false),
+        (&dict.mappings.fqdns, false),
+        (&dict.mappings.ipv6_addresses, false),
+        (&dict.mappings.mac_addresses, false),
+        (&dict.mappings.ssh_fps, false),
+        (&dict.mappings.backup_files, false),
+        (&dict.mappings.hostnames, false),
+        (&dict.mappings.objects, false),
+        (&dict.mappings.dbs, false),
     ];
-    for section in sections {
+    let mut candidates: Vec<(String, String, bool)> = Vec::with_capacity(actual_count);
+    for (section, is_lossy) in sections {
         for entry in *section {
             // SSH fingerprints are redacted (no recoverable original).
             // Skip them in reverse to avoid '[REDACTED]' → fingerprint collisions.
             if entry.anonymized.contains("[REDACTED") {
                 continue;
             }
-            reverse_pairs.push((entry.anonymized.clone(), entry.original.clone()));
+            candidates.push((entry.anonymized.clone(), entry.original.clone(), *is_lossy));
         }
     }
 
-    // Sort longest first for maximal munch
-    reverse_pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
+    println!("  Loaded {} mappings from dictionary", candidates.len());
 
-    // Detect collisions in anonymized values (would make reverse ambiguous)
-    let mut seen = HashSet::new();
-    for (anon, _) in &reverse_pairs {
-        if !seen.insert(anon.to_lowercase()) {
+    // Group by anonymized value to find collisions before deciding what to
+    // do about each one.
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (anon, _, _)) in candidates.iter().enumerate() {
+        groups.entry(anon.to_lowercase()).or_default().push(i);
+    }
+
+    let mut excluded: HashSet<usize> = HashSet::new();
+    let mut unresolved: Vec<(String, Vec<String>)> = Vec::new();
+    for indices in groups.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        if indices.iter().all(|&i| candidates[i].2) {
+            // Exactly the situation this fix exists for: several distinct
+            // originals — real IPv4 addresses — were always going to mask to
+            // the same string, because the mask keeps only the last two
+            // octets. There is no way to tell which original produced this
+            // anonymized value, so it is left as-is in the restored output
+            // rather than guessed at; everything else in the dictionary,
+            // including other entities in the same files, is unaffected.
+            let anon = candidates[indices[0]].0.clone();
+            let mut originals: Vec<String> =
+                indices.iter().map(|&i| candidates[i].1.clone()).collect();
+            originals.sort();
+            unresolved.push((anon, originals));
+            excluded.extend(indices.iter().copied());
+        } else {
+            // A collision outside the known one-way entity kinds means two
+            // logically distinct values were handed the *same* replacement
+            // by code whose whole job is to guarantee that never happens
+            // (the `used_*` sets in build_map). Unlike the IPv4 case above,
+            // there is no legitimate reason for that, so this can only mean
+            // the dictionary was hand-edited, merged, or otherwise tampered
+            // with after export — abort rather than restore from it.
             anyhow::bail!(
-                "Dictionary corruption: anonymized value '{}' appears multiple times — reverse mapping is ambiguous",
-                anon
+                "Dictionary corruption: anonymized value '{}' appears multiple times outside \
+                 the known one-way entity kinds (IPv4) — reverse mapping is ambiguous",
+                candidates[indices[0]].0
             );
         }
     }
 
-    println!("  Loaded {} mappings from dictionary", reverse_pairs.len());
+    if !unresolved.is_empty() {
+        unresolved.sort_by(|a, b| a.0.cmp(&b.0));
+        eprintln!(
+            "  ⚠ {} anonymized value(s) cannot be reversed — IPv4 masking keeps only the last \
+             two octets, so distinct addresses that share them produce the same masked string:",
+            unresolved.len()
+        );
+        for (anon, originals) in &unresolved {
+            eprintln!("    {} <- could be any of: {}", anon, originals.join(", "));
+        }
+        eprintln!(
+            "    Left as-is in the restored output. Everything else — including other entities \
+             in the same files — is restored normally."
+        );
+    }
+
+    let mut reverse_pairs: Vec<(String, String)> = candidates
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !excluded.contains(i))
+        .map(|(_, (anon, orig, _))| (anon, orig))
+        .collect();
+
+    // Sort longest first for maximal munch
+    reverse_pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
 
     // Reverse path-safe pairs (anonymized → original) to restore the original
     // file/directory names. Mirrors collect_path_replacement_pairs: only the
