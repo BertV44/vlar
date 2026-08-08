@@ -110,6 +110,63 @@ left `--paranoid` reporting phantom leaks. Single-backslash escapes (`\b \f \n \
 no longer treated as `DOMAIN\user` in JSON-encoded content. Plain-text `.log` detection is
 unchanged.
 
+## What's new in v2.7.2
+
+Three defects found by a QA pass over the whole tool. All three predate v2.7.
+
+### Hostile `.zip` entry names no longer escape the output (#10)
+
+A support bundle is untrusted input — it arrives from a customer by mail or upload — and entry
+names were joined onto the output path without sanitising. An entry named `../../ESCAPED.log`
+landed **two levels above** the directory given to `-o`, with exit code 0 and no mention in the
+output listing. `--output-zip` repacked the traversal name verbatim, so the archive you send to
+support was itself a zip-slip archive aimed at whoever extracts it.
+
+Both writers now reduce every destination to a safe relative path, covering `../`, absolute names
+and Windows drive/UNC shapes. Entries are **contained, not dropped** — the content is still
+anonymized and still delivered — and every rewrite is reported:
+
+```
+  ⚠ 2 zip entr(ies) had a path that would have written outside the output:
+      ../../ESCAPED.log  ->  ESCAPED.log
+      /tmp/ABS.log       ->  tmp/ABS.log
+```
+
+Silently fixing a hostile bundle would deny you the only signal that you received one.
+
+### `--validate-only` no longer leaks names through file paths (#11)
+
+The report documents "counts by entity kind and by file — never the original values", but
+`by_file[].file` and `source` were the raw paths, which carry hostnames, VM names and job names.
+This is the output most likely to leave the machine, since it exists to be piped into `jq` and
+automation. Both fields now go through the same mapping the normal output tree uses, so IP/MAC
+keep their documented `10.0.0.21` → `xx.xx.0.21` rendering.
+
+The report ignores `--keep-path-names` deliberately: that flag opts a human out of renaming in an
+output tree they inspect before sharing, and the report has no such inspection step. Combining the
+two prints an explanatory note on stderr. stdout stays pure JSON.
+
+### `--reverse` no longer aborts on a one-way IPv4 mask collision (#12)
+
+IPv4 masking keeps only the last two octets and is deliberately one-way, but it was the only
+entity kind with no collision guard. A proxy on `192.168.1.10` and a repository on `10.0.1.10` —
+an ordinary addressing convention — both mask to `**.**.1.10`, and the reverse path treated that
+as dictionary corruption and refused to run at all. **Nothing** was restored, including entities
+in the same file that were perfectly reversible.
+
+The check now separates the two cases it was conflating. A duplicate confined to IPv4 is expected,
+since that mapping is many-to-one by design: those entries are left masked rather than guessed,
+and named in a warning with every candidate original. A duplicate touching a collision-checked
+kind can only come from a tampered dictionary, and still aborts.
+
+```
+  ⚠ 1 anonymized value(s) cannot be reversed — IPv4 masking keeps only the last two
+    octets, so distinct addresses that share them produce the same masked string:
+      **.**.1.10 <- could be any of: 10.0.1.10, 192.168.1.10
+```
+
+The mask format in anonymized output is unchanged.
+
 ## What's new in v2.7.1
 
 ### `DOMAIN\user` is now detected in JSON-encoded traces
