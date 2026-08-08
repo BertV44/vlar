@@ -2526,12 +2526,27 @@ struct StageStats {
 
 /// Strip a zip entry name down to safe relative components.
 ///
-/// Zip entries can carry `..` or absolute paths ("zip slip"); joining those onto an
-/// output root writes outside it. Keep only plain components.
+/// Zip entries can carry `..`, a leading `/`, or a Windows drive/UNC shape
+/// ("zip slip"); joining any of those onto an output root writes outside it.
+/// Splitting on both `/` and `\` and dropping empty/`.`/`..` segments handles
+/// `../../x`, `/etc/passwd` (leading empty segment) and `\\server\share\x`
+/// (every separator run between "\\server" and "share" produces an empty
+/// segment too) uniformly. Keep only plain components.
 fn safe_relative(name: &str) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for seg in name.split(['/', '\\']) {
         if seg.is_empty() || seg == "." || seg == ".." {
+            continue;
+        }
+        // A bare drive letter ("C:") is a path *prefix* on Windows, not an
+        // ordinary component — `Path::join` special-cases a path that
+        // carries one: instead of extending `self` it discards it, exactly
+        // as it does for an absolute path. Letting "C:" through here would
+        // mean `out_dir.join(rel)` on a Windows build resolves to
+        // `C:\Windows\...`, replacing the output root entirely — the same
+        // escape as `../..`, just spelled with a drive letter instead of
+        // dots.
+        if seg.len() == 2 && seg.as_bytes()[0].is_ascii_alphabetic() && seg.as_bytes()[1] == b':' {
             continue;
         }
         out.push(seg);
@@ -4074,6 +4089,66 @@ fn transform_entry(
 
 /// Repack: read each entry, anonymize, write into a new zip preserving the
 /// (anonymized) tree and last-modified timestamps. One entry at a time.
+/// Entry destinations that could not be used as-is, for reporting.
+///
+/// A `.zip` bundle is untrusted input — it arrives from a customer by mail or
+/// upload — so any entry that had to be rewritten is worth naming out loud rather
+/// than fixing in silence: it is the operator's only signal that the bundle was
+/// malformed or hostile.
+#[derive(Default)]
+struct EntryPathFixups {
+    rewritten: Vec<(String, String)>,
+    dropped: Vec<String>,
+}
+
+impl EntryPathFixups {
+    /// Reduce an entry's destination to something that cannot escape the output,
+    /// recording whatever had to change.
+    ///
+    /// Sanitising happens here, at the point of use, rather than where entry names
+    /// are anonymized: the value that actually reaches `out_dir.join()` or
+    /// `ZipWriter::start_file()` is the one that has to be safe, and checking it
+    /// here means a later change to name anonymization cannot quietly reopen the
+    /// hole.
+    fn resolve(&mut self, anon_name: &str) -> Option<PathBuf> {
+        let Some(safe) = safe_relative(anon_name) else {
+            self.dropped.push(anon_name.to_string());
+            return None;
+        };
+        if safe.to_string_lossy().replace('\\', "/") != anon_name {
+            self.rewritten.push((
+                anon_name.to_string(),
+                safe.to_string_lossy().replace('\\', "/"),
+            ));
+        }
+        Some(safe)
+    }
+
+    fn report(&self) {
+        if self.rewritten.is_empty() && self.dropped.is_empty() {
+            return;
+        }
+        eprintln!(
+            "  ⚠ {} zip entr(ies) had a path that would have written outside the output:",
+            self.rewritten.len() + self.dropped.len()
+        );
+        for (from, to) in &self.rewritten {
+            eprintln!("      {from}  ->  {to}");
+        }
+        for from in &self.dropped {
+            eprintln!("      {from}  ->  dropped (nothing left after removing traversal)");
+        }
+        eprintln!("    Entry names are taken from the input archive, which is untrusted: an entry");
+        eprintln!("    named `../../x` would otherwise land outside -o, and be repacked into the");
+        eprintln!("    archive you send on. The content itself was anonymized as usual.");
+    }
+}
+
+/// Zip entry name as a forward-slash string, for writing back into an archive.
+fn entry_name_for_zip(safe: &Path) -> String {
+    safe.to_string_lossy().replace('\\', "/")
+}
+
 fn write_zip_output(
     zip_path: &Path,
     out_zip: &Path,
@@ -4095,10 +4170,19 @@ fn write_zip_output(
         .with_context(|| format!("Failed to create output zip: {}", out_zip.display()))?;
     let mut writer = zip::ZipWriter::new(out_file);
 
+    let mut fixups = EntryPathFixups::default();
+
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let name = entry.name().to_string();
         let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names);
+        // Repacking a traversal name unchanged would hand the attack downstream:
+        // the archive going to support would itself write outside whatever
+        // directory the recipient extracts it into.
+        let Some(safe) = fixups.resolve(&anon_name) else {
+            continue;
+        };
+        let safe_name = entry_name_for_zip(&safe);
 
         let mut options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
@@ -4107,7 +4191,7 @@ fn write_zip_output(
         }
 
         if entry.is_dir() {
-            writer.add_directory(anon_name, options)?;
+            writer.add_directory(safe_name, options)?;
             continue;
         }
 
@@ -4115,11 +4199,12 @@ fn write_zip_output(
         entry.read_to_end(&mut bytes)?;
         let out_bytes = transform_entry(&name, bytes, map, exclude);
 
-        writer.start_file(anon_name, options)?;
+        writer.start_file(safe_name, options)?;
         writer.write_all(&out_bytes)?;
     }
 
     writer.finish()?;
+    fixups.report();
     Ok(())
 }
 
@@ -4137,6 +4222,8 @@ fn extract_zip_output(
     let in_file = fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(in_file)?;
 
+    let mut fixups = EntryPathFixups::default();
+
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         if !entry.is_file() {
@@ -4144,7 +4231,13 @@ fn extract_zip_output(
         }
         let name = entry.name().to_string();
         let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names);
-        let out_path = out_dir.join(&anon_name);
+        // `out_dir.join()` happily walks out of `out_dir` when the entry name says
+        // so — `../../x` lands two levels above it, and an absolute or drive-letter
+        // name replaces it outright.
+        let Some(safe) = fixups.resolve(&anon_name) else {
+            continue;
+        };
+        let out_path = out_dir.join(&safe);
 
         if let Some(parent) = out_path.parent() {
             if !parent.exists() {
@@ -4164,6 +4257,7 @@ fn extract_zip_output(
         fs::write(&out_path, &out_bytes)
             .with_context(|| format!("Failed to write: {}", out_path.display()))?;
     }
+    fixups.report();
     Ok(())
 }
 

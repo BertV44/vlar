@@ -2445,3 +2445,205 @@ fn same_account_consistent_across_log_and_trace() {
         "round trip through the dictionary must restore b.trace's original bytes"
     );
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Zip-slip: hostile entry names in an untrusted bundle
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Write a zip with entry names exactly as given, bypassing any normalisation
+/// `make_zip` might apply — the whole point here is to produce names a well-behaved
+/// writer would refuse.
+fn make_zip_raw(path: &Path, entries: &[(&str, &str)]) {
+    use std::io::Write;
+    let file = fs::File::create(path).unwrap();
+    let mut zw = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, content) in entries {
+        zw.start_file(*name, opts).unwrap();
+        zw.write_all(content.as_bytes()).unwrap();
+    }
+    zw.finish().unwrap();
+}
+
+/// A `.zip` bundle is untrusted input — it arrives from a customer. An entry named
+/// `../../x` used to be joined straight onto the output root, landing outside the
+/// directory the operator named, with exit code 0 and no mention in the listing.
+#[test]
+fn zip_traversal_entry_stays_inside_output_dir() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("evil.zip");
+    let out = dir.path().join("a/b/out");
+    fs::create_dir_all(&out).unwrap();
+    make_zip_raw(
+        &in_zip,
+        &[
+            ("good/Svc.log", "legit admin@corp.com 10.1.1.1\n"),
+            ("../../ESCAPED.log", "escaped erin@corp.com 10.2.2.2\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // Nothing may exist above the output directory.
+    for stray in ["a/ESCAPED.log", "a/b/ESCAPED.log", "ESCAPED.log"] {
+        assert!(
+            !dir.path().join(stray).exists(),
+            "{stray} was written outside -o"
+        );
+    }
+    // The content is still anonymized and still delivered, just contained.
+    let names = rel_paths(&out);
+    assert!(
+        names.iter().any(|n| n.ends_with("ESCAPED.log")),
+        "the entry should be kept inside -o, not dropped: {names:?}"
+    );
+    for p in collect_files(&out) {
+        let c = fs::read_to_string(&p).unwrap();
+        assert!(
+            !c.contains("@corp.com") && !c.contains("10.1.1.1") && !c.contains("10.2.2.2"),
+            "{} not anonymized: {c}",
+            p.display()
+        );
+    }
+    // And the operator is told, rather than it being fixed in silence.
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("outside the output"),
+        "rewritten entries must be reported. stderr: {stderr}"
+    );
+}
+
+/// Repacking a traversal name unchanged hands the attack downstream: the archive
+/// sent to support would itself write outside wherever the recipient extracts it.
+#[test]
+fn repacked_zip_carries_no_traversal_entry() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("evil.zip");
+    let out_zip = dir.path().join("anon.zip");
+    make_zip_raw(
+        &in_zip,
+        &[
+            ("good/Svc.log", "legit admin@corp.com\n"),
+            ("../../ESCAPED.log", "escaped erin@corp.com\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    for (name, _) in read_zip(&out_zip) {
+        assert!(
+            !name.contains(".."),
+            "traversal entry repacked into the output archive: {name}"
+        );
+        assert!(
+            !name.starts_with('/'),
+            "absolute entry repacked into the output archive: {name}"
+        );
+    }
+}
+
+/// Absolute and Windows drive-letter names escape just as effectively as `../..` —
+/// `Path::join` discards the root it was given for both.
+#[test]
+fn zip_absolute_and_drive_letter_entries_are_contained() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("evil.zip");
+    let out = dir.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    make_zip_raw(
+        &in_zip,
+        &[
+            ("/tmp/ABS.log", "abs dave@corp.com\n"),
+            ("C:/Windows/DRIVE.log", "drive carol@corp.com\n"),
+            ("ok/Fine.log", "fine bob@corp.com\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    for p in collect_files(&out) {
+        assert!(
+            p.starts_with(&out),
+            "{} escaped the output directory",
+            p.display()
+        );
+    }
+    assert!(
+        !Path::new("/tmp/ABS.log").exists(),
+        "absolute entry was written to /tmp"
+    );
+}
+
+/// A bundle with ordinary entry names must be completely unaffected by the
+/// sanitising — same tree, same contents, and no warning.
+#[test]
+fn ordinary_zip_unaffected_by_path_sanitising() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("bundle.zip");
+    let out_zip = dir.path().join("anon.zip");
+    make_zip(
+        &in_zip,
+        &[
+            ("Svc.log", "admin@corp.com\n"),
+            ("sub/dir/Proxy.trace", "{\"m\":\"erin@corp.com\"}\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--keep-path-names",
+    ]);
+    assert!(o.status.success());
+    let names: Vec<String> = read_zip(&out_zip).into_iter().map(|(n, _)| n).collect();
+    assert!(names.contains(&"Svc.log".to_string()), "got {names:?}");
+    assert!(
+        names.contains(&"sub/dir/Proxy.trace".to_string()),
+        "nested path must be preserved verbatim: {names:?}"
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !stderr.contains("outside the output"),
+        "a clean bundle must not trigger the warning. stderr: {stderr}"
+    );
+}
