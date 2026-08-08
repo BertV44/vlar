@@ -136,16 +136,35 @@ still anonymized and still delivered — and every rewrite is reported:
     no entry is lost. The content itself was anonymized as usual.
 ```
 
-Silently fixing a hostile bundle would deny you the only signal that you received one — so the
-warning has to stay rare. It fires only on a name that genuinely escapes; a trailing `/` on a
-directory entry or a `./` prefix is normalisation, not an escape, and stays quiet. Otherwise
-every archive produced by `zip -r` would trip it and the signal would be worthless.
+Silently fixing a hostile bundle would deny you the only signal that you received one — so that
+warning has to stay meaningful. It fires only on a name that genuinely escapes: a leading `/`, a
+`..` segment, or a Windows drive prefix. A trailing `/` on a directory entry and a `./` prefix are
+normalisation, not escapes, and stay quiet; otherwise every archive produced by `zip -r` would
+trip it and the signal would be worthless. An entry whose name reduces to nothing (`../..`) is
+dropped and listed as such.
 
-Two edge cases are handled rather than left to chance. An entry whose name reduces to nothing
-(`../..`) is dropped and listed as such. Entries that collide once made relative — `dup.log` and
-`../dup.log` both want `dup.log` — get a numeric suffix (`dup-1.log`), because the alternative is
-overwriting one entry's anonymized content when extracting, or having the zip writer reject the
-duplicate and abort with a partial archive on disk.
+**Colliding destinations are a separate, benign case, and get their own message.** Two entries can
+want the same name without anything hostile going on — most often because the filesystem-safe IP
+rendering is lossy, so `Agent.10.0.1.21.log` and `Agent.192.168.1.21.log` both become
+`Agent.xx.xx.1.21.log`. That is an ordinary bundle, and telling you it is untrusted would be a
+false alarm:
+
+```
+  ⚠ 1 zip entr(ies) wanted a destination already taken, and were renamed:
+      Agent.xx.xx.1.21.log  ->  Agent.xx.xx.1.21-1.log
+    Nothing hostile about this on its own — the filesystem-safe IP rendering
+    is lossy, so two addresses sharing their last two octets give one name.
+    A numeric suffix keeps both. The content itself was anonymized as usual.
+```
+
+This case is worth calling out because v2.7.1 handled it badly on perfectly normal input:
+`--output-zip` aborted with `Duplicate filename` and produced nothing, while `-o` silently
+overwrote one file and exited 0. Both entries now survive, in every mode — including entries
+expanded from a nested archive under `--expand-archives`.
+
+Both messages are printed even when the run later fails part-way through, so an error on a corrupt
+entry no longer hides the fact that the same archive also carried traversal names — which matters
+in extract mode, where those files are already on disk by then.
 
 ### `--validate-only` no longer leaks names through file paths (#11)
 

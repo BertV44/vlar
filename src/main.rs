@@ -2532,21 +2532,41 @@ struct StageStats {
 /// `../../x`, `/etc/passwd` (leading empty segment) and `\\server\share\x`
 /// (every separator run between "\\server" and "share" produces an empty
 /// segment too) uniformly. Keep only plain components.
+/// `Some(remainder)` when a path segment opens with a Windows drive prefix.
+///
+/// `"C:"` yields `""` (the prefix was the whole segment); `"C:REL.log"` yields
+/// `"REL.log"`.
+fn strip_drive_prefix(seg: &str) -> Option<&str> {
+    let b = seg.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        Some(&seg[2..])
+    } else {
+        None
+    }
+}
+
 fn safe_relative(name: &str) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for seg in name.split(['/', '\\']) {
         if seg.is_empty() || seg == "." || seg == ".." {
             continue;
         }
-        // A bare drive letter ("C:") is a path *prefix* on Windows, not an
-        // ordinary component — `Path::join` special-cases a path that
-        // carries one: instead of extending `self` it discards it, exactly
-        // as it does for an absolute path. Letting "C:" through here would
-        // mean `out_dir.join(rel)` on a Windows build resolves to
-        // `C:\Windows\...`, replacing the output root entirely — the same
-        // escape as `../..`, just spelled with a drive letter instead of
-        // dots.
-        if seg.len() == 2 && seg.as_bytes()[0].is_ascii_alphabetic() && seg.as_bytes()[1] == b':' {
+        // A drive letter is a path *prefix* on Windows, not an ordinary component
+        // — `Path::join` special-cases a path carrying one: instead of extending
+        // `self` it discards it, exactly as it does for an absolute path. Letting
+        // it through would mean `out_dir.join(rel)` on a Windows build resolves to
+        // `C:\Windows\...`, replacing the output root entirely — the same escape as
+        // `../..`, spelled with a drive letter instead of dots.
+        //
+        // Both spellings have to go. `C:` alone is the separator-delimited form,
+        // but `C:REL.log` is drive-*relative* and carries no separator at all, so
+        // splitting never isolates it; only the prefix is dropped there, keeping
+        // the name it qualified.
+        if let Some(rest) = strip_drive_prefix(seg) {
+            if rest.is_empty() {
+                continue;
+            }
+            out.push(rest);
             continue;
         }
         out.push(seg);
@@ -2690,6 +2710,9 @@ fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
                 None => root.join(&base_name),
             };
             stats.archives += 1;
+            // Fresh per archive: each expands into its own `.extracted/` directory,
+            // so names only compete with others from the same archive.
+            let mut fixups = EntryPathFixups::default();
 
             for i in 0..archive.len() {
                 // A damaged entry skips that entry only. Aborting the whole run for
@@ -2709,7 +2732,12 @@ fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
                 if !entry_is_text(&name) {
                     continue;
                 }
-                let Some(safe) = safe_relative(&name) else {
+                // Same sanitising and collision handling the two output writers use.
+                // Without it, an archive holding both `dup.log` and `../dup.log`
+                // collapsed them onto one staged path and `create_new_file` refused
+                // the second, aborting the whole run and writing nothing — the exact
+                // failure removed from the other writers.
+                let Some(safe) = fixups.resolve(&name) else {
                     continue;
                 };
                 let dest = base.join(&safe);
@@ -3222,6 +3250,10 @@ fn reverse_anonymize(dict_path: &Path, input_files: &[PathBuf], cli: &Cli) -> Re
             let mut originals: Vec<String> =
                 indices.iter().map(|&i| candidates[i].1.clone()).collect();
             originals.sort();
+            // The group can hold the same original more than once (a dictionary
+            // exported twice); listing it twice would suggest it competes with
+            // itself.
+            originals.dedup();
             unresolved.push((anon, originals));
             excluded.extend(indices.iter().copied());
         } else {
@@ -4235,9 +4267,17 @@ fn transform_entry(
 /// upload — so any entry that had to be rewritten is worth naming out loud rather
 /// than fixing in silence: it is the operator's only signal that the bundle was
 /// malformed or hostile.
+/// The two are reported separately because they mean different things to the
+/// operator: an escape says the bundle is malformed or hostile, a collision says two
+/// entries wanted the same destination — which happens on entirely ordinary bundles,
+/// most often because the filesystem-safe IP rendering is lossy (`Agent.10.0.1.21.log`
+/// and `Agent.192.168.1.21.log` both become `Agent.xx.xx.1.21.log`). Telling someone
+/// their bundle is untrusted because two of their proxies share a host number would
+/// be the same false alarm this reporting was rewritten to avoid.
 #[derive(Default)]
 struct EntryPathFixups {
-    rewritten: Vec<(String, String)>,
+    escaped: Vec<(String, String)>,
+    collided: Vec<(String, String)>,
     dropped: Vec<String>,
     /// Destinations already handed out, so two entries can never land on one file.
     used: HashSet<String>,
@@ -4255,12 +4295,8 @@ fn entry_name_escapes(name: &str) -> bool {
     if name.starts_with('/') || name.starts_with('\\') {
         return true;
     }
-    name.split(['/', '\\']).any(|seg| {
-        seg == ".."
-            || (seg.len() == 2
-                && seg.as_bytes()[0].is_ascii_alphabetic()
-                && seg.as_bytes()[1] == b':')
-    })
+    name.split(['/', '\\'])
+        .any(|seg| seg == ".." || strip_drive_prefix(seg).is_some())
 }
 
 impl EntryPathFixups {
@@ -4309,33 +4345,65 @@ impl EntryPathFixups {
                 n += 1;
             }
         }
-        if escapes || name != entry_name_for_zip(&safe) {
-            self.rewritten.push((anon_name.to_string(), name.clone()));
+        if escapes {
+            self.escaped.push((anon_name.to_string(), name.clone()));
+        } else if name != entry_name_for_zip(&safe) {
+            self.collided.push((anon_name.to_string(), name.clone()));
         }
         self.used.insert(name.clone());
         Some(PathBuf::from(name))
     }
 
     fn report(&self) {
-        if self.rewritten.is_empty() && self.dropped.is_empty() {
-            return;
+        if !self.escaped.is_empty() || !self.dropped.is_empty() {
+            eprintln!(
+                "  ⚠ {} zip entr(ies) had a name that points outside the output:",
+                self.escaped.len() + self.dropped.len()
+            );
+            for (from, to) in &self.escaped {
+                eprintln!("      {from}  ->  {to}");
+            }
+            for from in &self.dropped {
+                eprintln!("      {from}  ->  dropped (nothing left after removing traversal)");
+            }
+            eprintln!(
+                "    Entry names come from the input archive, which is untrusted: a name like"
+            );
+            eprintln!(
+                "    `../../x` would otherwise land outside -o and be repacked into the archive"
+            );
+            eprintln!("    you send on. Treat this bundle as malformed or hostile.");
         }
-        eprintln!(
-            "  ⚠ {} zip entr(ies) could not be written under their own name:",
-            self.rewritten.len() + self.dropped.len()
-        );
-        for (from, to) in &self.rewritten {
-            eprintln!("      {from}  ->  {to}");
+        if !self.collided.is_empty() {
+            eprintln!(
+                "  ⚠ {} zip entr(ies) wanted a destination already taken, and were renamed:",
+                self.collided.len()
+            );
+            for (from, to) in &self.collided {
+                eprintln!("      {from}  ->  {to}");
+            }
+            eprintln!(
+                "    Nothing hostile about this on its own — the filesystem-safe IP rendering"
+            );
+            eprintln!(
+                "    is lossy, so two addresses sharing their last two octets give one name."
+            );
+            eprintln!(
+                "    A numeric suffix keeps both. The content itself was anonymized as usual."
+            );
         }
-        for from in &self.dropped {
-            eprintln!("      {from}  ->  dropped (nothing left after removing traversal)");
-        }
-        eprintln!(
-            "    Entry names come from the input archive, which is untrusted: an entry named"
-        );
-        eprintln!("    `../../x` would otherwise land outside -o and be repacked into the archive");
-        eprintln!("    you send on. Names that collide once made relative get a numeric suffix so");
-        eprintln!("    no entry is lost. The content itself was anonymized as usual.");
+    }
+}
+
+/// Report on the way out, however the writer returns.
+///
+/// An error part-way through the entry loop used to skip the report entirely, so an
+/// operator whose run died on a corrupt entry never learned that the same archive
+/// also carried traversal names — and in extract mode those files were already on
+/// disk by then. `Drop` runs on the error path too.
+impl Drop for EntryPathFixups {
+    fn drop(&mut self) {
+        self.report();
     }
 }
 
@@ -4398,10 +4466,6 @@ fn write_zip_output(
         writer.write_all(&out_bytes)?;
     }
 
-    // Reported before finishing the archive: if writing out the central directory
-    // fails, the operator still learns that the input carried hostile names, which
-    // is very likely why it failed.
-    fixups.report();
     writer.finish()?;
     Ok(())
 }
@@ -4455,7 +4519,6 @@ fn extract_zip_output(
         fs::write(&out_path, &out_bytes)
             .with_context(|| format!("Failed to write: {}", out_path.display()))?;
     }
-    fixups.report();
     Ok(())
 }
 

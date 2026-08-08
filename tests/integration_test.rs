@@ -2682,7 +2682,7 @@ fn zip_traversal_entry_stays_inside_output_dir() {
     // And the operator is told, rather than it being fixed in silence.
     let stderr = String::from_utf8_lossy(&o.stderr);
     assert!(
-        stderr.contains("could not be written under their own name")
+        stderr.contains("had a name that points outside the output")
             && stderr.contains("../../ESCAPED.log"),
         "rewritten entries must be reported by name. stderr: {stderr}"
     );
@@ -2805,7 +2805,7 @@ fn ordinary_zip_unaffected_by_path_sanitising() {
     );
     let stderr = String::from_utf8_lossy(&o.stderr);
     assert!(
-        !stderr.contains("could not be written under their own name"),
+        !stderr.contains("had a name that points outside the output"),
         "a clean bundle must not trigger the warning. stderr: {stderr}"
     );
 }
@@ -3018,7 +3018,7 @@ fn ordinary_zip_with_directory_entries_raises_no_warning() {
     assert!(o.status.success());
     let stderr = String::from_utf8_lossy(&o.stderr);
     assert!(
-        !stderr.contains("could not be written under their own name"),
+        !stderr.contains("had a name that points outside the output"),
         "directory entries and ./ prefixes are not escapes. stderr: {stderr}"
     );
     let names: Vec<String> = read_zip(&out_zip).into_iter().map(|(n, _)| n).collect();
@@ -3142,4 +3142,119 @@ fn repeated_identical_ipv4_entry_still_reverses() {
         restored.contains("10.20.30.40"),
         "should have been restored: {restored}"
     );
+}
+
+/// Two entries can want the same destination without anything hostile going on:
+/// the filesystem-safe IP rendering is lossy, so `Agent.10.0.1.21.log` and
+/// `Agent.192.168.1.21.log` both become `Agent.xx.xx.1.21.log`. Telling the
+/// operator their bundle is untrusted for that would be the same false alarm the
+/// escape reporting was rewritten to avoid.
+#[test]
+fn benign_collision_is_not_reported_as_hostile() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("b.zip");
+    let out = TempDir::new().unwrap();
+    make_zip_raw(
+        &in_zip,
+        &[
+            ("Agent.10.0.1.21.log", "a admin@corp.com 10.0.1.21\n"),
+            ("Agent.192.168.1.21.log", "b bob@corp.com 192.168.1.21\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(o.status.success());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("wanted a destination already taken"),
+        "the collision must be reported. stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("points outside the output")
+            && !stderr.contains("Treat this bundle as malformed or hostile"),
+        "an ordinary bundle must not be reported as an escape. stderr: {stderr}"
+    );
+    assert_eq!(
+        collect_files(out.path()).len(),
+        2,
+        "v2.7.1 lost one of these; both must survive"
+    );
+}
+
+/// `C:REL.log` is drive-*relative* — it carries no separator, so splitting never
+/// isolates the prefix. On Windows `PathBuf::push` replaces the root for a path
+/// with a prefix, so it escapes just as `../..` does.
+#[test]
+fn drive_relative_entry_is_contained_and_reported() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("d.zip");
+    let out_zip = dir.path().join("o.zip");
+    make_zip_raw(&in_zip, &[("C:REL.log", "x erin@corp.com\n")]);
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(o.status.success());
+    let names: Vec<String> = read_zip(&out_zip).into_iter().map(|(n, _)| n).collect();
+    assert!(
+        names.contains(&"REL.log".to_string()),
+        "drive prefix must be stripped, keeping the name it qualified: {names:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("points outside the output"),
+        "a drive-relative name is an escape and must be reported"
+    );
+}
+
+/// A nested archive holding both `dup.log` and `../dup.log` used to abort the whole
+/// staging run and write nothing — the same failure removed from the two output
+/// writers, left behind in the third consumer of entry names.
+#[test]
+fn expand_archives_survives_colliding_nested_entries() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    make_zip_raw(
+        &src.path().join("Inner.zip"),
+        &[
+            ("dup.log", "one admin@corp.com\n"),
+            ("../dup.log", "two erin@corp.com\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--expand-archives",
+    ]);
+    assert!(
+        o.status.success(),
+        "a colliding nested archive must not kill the run. stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let bodies: Vec<String> = collect_files(out.path())
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap_or_default())
+        .collect();
+    for marker in ["one", "two"] {
+        assert!(
+            bodies.iter().any(|b| b.starts_with(marker)),
+            "{marker} lost; got {bodies:?}"
+        );
+    }
 }
