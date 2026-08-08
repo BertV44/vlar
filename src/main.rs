@@ -3769,6 +3769,33 @@ struct ScannedUnit {
 }
 
 /// Build the validate-only JSON report from scanned units + the explicit lists.
+///
+/// `by_file[].file` and `source` are run through the exact same path-anonymization
+/// mapping a real anonymizing run would apply to its output tree — built from this
+/// scan's own union of entities via `build_map` + `collect_path_replacement_pairs`,
+/// the same two calls `run_anonymize`/`run_zip` make before writing anything. Before
+/// this fix the raw relative path was copied straight into `by_file[].file`: a folder
+/// named after a hostname or VM (`SRV-PROD-CRM01/Task.SRV-PROD-CRM01-vm-finance-db.log`)
+/// came out verbatim, even though the report's own docs promise entity counts "by kind
+/// and by file — never the original values" (issue #11). The one output built to be
+/// piped unattended into a pipeline was the one output that still leaked.
+///
+/// Because the map is randomly generated fresh per invocation (same as content
+/// anonymization already is), a report and a *separately run* anonymizing pass over
+/// the same input won't share literal hostname/email/domain tokens — that's an
+/// existing property of the tool, not something this fix changes. What *is*
+/// consistent across runs is the rendering: IPv4/IPv6/MAC use a deterministic mask
+/// (`10.0.0.21` → `xx.xx.0.21`, unaffected by run-to-run randomness) and every
+/// replacement is passed through the same `to_path_safe` transform a real output
+/// tree's names get, so a reader learns the same shape of name either way.
+///
+/// This anonymization is unconditional: `--keep-path-names` is deliberately NOT
+/// consulted here (see the note in `run_validate_only`). That flag lets a human opt a
+/// normal run's *output tree* out of renaming, because a human inspects that tree
+/// before deciding whether to share it. The validate-only report has no equivalent
+/// inspection step — it exists specifically to be piped straight into `jq`/automation —
+/// so honoring the flag here would just reopen this exact leak behind a switch whose
+/// documented purpose has nothing to do with report contents.
 fn build_validate_report(
     units: Vec<ScannedUnit>,
     exclude: &ExcludeFilter,
@@ -3777,34 +3804,21 @@ fn build_validate_report(
 ) -> ValidateReport {
     let files_scanned = units.len();
 
-    // Per-file section.
-    let mut by_file: Vec<FileEntities> = Vec::with_capacity(units.len());
+    // Pass 1: per-file (raw path, kind counts) + accumulate the union. Raw paths
+    // are held only transiently in `per_file` — they're anonymized in pass 2,
+    // below, before anything is assembled into the report.
+    let mut per_file: Vec<(String, Vec<(EntityKind, usize)>)> = Vec::with_capacity(units.len());
     let mut union = ExtractedEntities::default();
     for unit in units {
         let counts = kind_counts(&unit.entities, exclude);
-        let entity_count: usize = counts.iter().map(|(_, n)| n).sum();
-        if entity_count > 0 {
-            by_file.push(FileEntities {
-                file: unit.rel,
-                entity_count,
-                entities: counts
-                    .into_iter()
-                    .map(|(k, n)| KindCount {
-                        kind: k.to_string(),
-                        occurrences: n,
-                    })
-                    .collect(),
-            });
+        if counts.iter().map(|(_, n)| n).sum::<usize>() > 0 {
+            per_file.push((unit.rel, counts));
         }
         union.merge(unit.entities);
     }
-    by_file.sort_by(|a, b| {
-        b.entity_count
-            .cmp(&a.entity_count)
-            .then(a.file.cmp(&b.file))
-    });
 
-    // Global summary: unique auto-detected counts + explicit-list sizes.
+    // Global summary: unique auto-detected counts + explicit-list sizes. Computed
+    // from `union` by reference — `union` is moved into `build_map` right after.
     let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for (k, n) in kind_counts(&union, exclude) {
         by_kind.insert(k.to_string(), n);
@@ -3820,11 +3834,47 @@ fn build_validate_report(
     }
     let entities_total: usize = by_kind.values().sum();
 
+    // Same map a real anonymizing run over this input would build: content entities,
+    // whatever the union already picked up from path names (extract_entities_with_path
+    // scans both), and the hostname/object/db explicit lists — so report names match a
+    // real output tree name-for-name. Never persisted; it lives only for this call.
+    let map = build_map(union, exclude, cfg);
+    let path_pairs = collect_path_replacement_pairs(&map);
+    let anon_path = |raw: &str| -> String {
+        anonymize_relative_path(Path::new(raw), &path_pairs)
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    // Pass 2: assemble by_file with anonymized paths.
+    let mut by_file: Vec<FileEntities> = per_file
+        .into_iter()
+        .map(|(rel, counts)| {
+            let entity_count = counts.iter().map(|(_, n)| n).sum();
+            FileEntities {
+                file: anon_path(&rel),
+                entity_count,
+                entities: counts
+                    .into_iter()
+                    .map(|(k, n)| KindCount {
+                        kind: k.to_string(),
+                        occurrences: n,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    by_file.sort_by(|a, b| {
+        b.entity_count
+            .cmp(&a.entity_count)
+            .then(a.file.cmp(&b.file))
+    });
+
     ValidateReport {
         tool_version: VERSION.to_string(),
         mode: "validate-only".to_string(),
         scanned_at: Local::now().to_rfc3339(),
-        source: source.to_string(),
+        source: anon_path(source),
         product: "VBR".to_string(),
         summary: ValidateSummary {
             files_scanned,
@@ -3839,6 +3889,21 @@ fn build_validate_report(
 /// report to stdout or `--report-output`, writes nothing, and returns the
 /// deterministic exit code (2 if any entity detected, else 0).
 fn run_validate_only(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i32> {
+    // --keep-path-names governs the output TREE of a normal run, which a human
+    // reviews before deciding whether to share it. This report has no such review
+    // step by design — it is meant to be piped straight into jq/automation — so its
+    // path names stay anonymized even when --keep-path-names is set. Said here, once,
+    // rather than silently: a flag that visibly changes one output and silently not
+    // the other is the kind of surprise that erodes trust in the tool.
+    if cli.keep_path_names {
+        eprintln!(
+            "  ℹ --keep-path-names has no effect on the --validate-only report: its file/source"
+        );
+        eprintln!(
+            "    paths are always anonymized (the report is built for unattended pipelines)."
+        );
+    }
+
     let (units, source) = if cli.input_is_zip() {
         let zip_path = zip_input_path(cli);
         (
