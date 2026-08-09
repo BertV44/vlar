@@ -900,6 +900,132 @@ fn mac_address_anonymized() {
     assert!(!anonymized.contains("005056962A77"), "Compact MAC must go");
 }
 
+/// #13: `00:50:56:...` is the VMware OUI, so a colon MAC with a hex letter
+/// is the common case in a Veeam bundle, not the exotic one. It used to be
+/// claimed by the IPv6 channel (which `--exclude mac` never touches), so it
+/// got masked with the IPv6 format and survived `-e mac` intact. Reproduces
+/// the exact report from the issue: with `-e mac`, both the hex-letter MAC
+/// and the all-digit MAC must survive untouched.
+#[test]
+fn exclude_mac_preserves_hex_letter_mac() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("a.log"),
+        "hexmac 00:50:56:96:AA:77 digitmac 00:11:22:33:44:55\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "-e",
+        "mac",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let anonymized = fs::read_to_string(output_dir.path().join("a.log")).unwrap();
+    assert!(
+        anonymized.contains("00:50:56:96:AA:77"),
+        "-e mac must preserve a MAC with hex letters. Got: {}",
+        anonymized
+    );
+    assert!(
+        anonymized.contains("00:11:22:33:44:55"),
+        "-e mac must still preserve an all-digit MAC. Got: {}",
+        anonymized
+    );
+}
+
+/// Without `--exclude`, a colon MAC containing hex letters must come out
+/// wearing the documented MAC mask (`**:**:**:**:**:XX`) rather than the
+/// IPv6 mask it used to get when the IPv6 channel claimed it first.
+#[test]
+fn hex_letter_mac_gets_mac_mask_by_default() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("a.log"),
+        "hexmac 00:50:56:96:AA:77 digitmac 00:11:22:33:44:55\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let anonymized = fs::read_to_string(output_dir.path().join("a.log")).unwrap();
+    assert!(
+        anonymized.contains("**:**:**:**:**:77"),
+        "hex-letter MAC must get the MAC mask, not the IPv6 mask. Got: {}",
+        anonymized
+    );
+    assert!(
+        anonymized.contains("**:**:**:**:**:55"),
+        "all-digit MAC must keep getting the MAC mask. Got: {}",
+        anonymized
+    );
+    assert!(!anonymized.contains("00:50:56:96:AA:77"));
+    assert!(!anonymized.contains("00:11:22:33:44:55"));
+}
+
+/// `--exclude ipv6` alone must still preserve a genuine IPv6 address, and a
+/// colon MAC elsewhere in the same file must still be masked — the two
+/// channels stay independent after the #13 fix.
+#[test]
+fn exclude_ipv6_preserves_ipv6_and_mac_still_masked() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("a.log"),
+        "hexmac 00:50:56:96:AA:77 addr 2a01:cb05:8c57:6800:250:56ff:fe96:aa77\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "-e",
+        "ipv6",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let anonymized = fs::read_to_string(output_dir.path().join("a.log")).unwrap();
+    assert!(
+        anonymized.contains("2a01:cb05:8c57:6800:250:56ff:fe96:aa77"),
+        "-e ipv6 must preserve the genuine IPv6 address. Got: {}",
+        anonymized
+    );
+    assert!(
+        !anonymized.contains("00:50:56:96:AA:77"),
+        "MAC must still be masked when only ipv6 is excluded. Got: {}",
+        anonymized
+    );
+}
+
 #[test]
 fn ssh_fingerprint_redacted() {
     let input_dir = TempDir::new().unwrap();

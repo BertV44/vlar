@@ -243,6 +243,14 @@ static RE_JWT: LazyLock<Regex> = LazyLock::new(|| {
 /// Matches 8 hextets, OR uses `::` compression, with at least 3 colons total.
 /// Trailing `%iface` zone identifier is captured as part of the match for
 /// proper anonymization but not required.
+///
+/// This is deliberately loose (it also matches a bare 6-group colon MAC,
+/// since a MAC is just six groups of 2 hex digits and this pattern allows
+/// 2-7 groups of 1-4). That ambiguity is resolved at extraction time, not
+/// here: `extract_entities_of_kind` runs `RE_MAC_COLON` first and skips any
+/// IPv6 candidate already claimed as a MAC (see #13) — a real IPv6 address
+/// either compresses with `::` or has all 8 hextets, so an unambiguous
+/// 6-group MAC shape can never be a genuine IPv6 match.
 static RE_IPV6: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:[0-9a-f]{1,4}:){2,7}(?:[0-9a-f]{1,4}|:)(?:%[a-zA-Z0-9_-]+)?\b").unwrap()
 });
@@ -251,6 +259,9 @@ static RE_IPV6: LazyLock<Regex> = LazyLock::new(|| {
 ///   - Canonical: `XX:XX:XX:XX:XX:XX` (colon) or `XX-XX-XX-XX-XX-XX` (hyphen)
 ///   - Compact: `XXXXXXXXXXXX` (12 hex chars, no separator) — only when
 ///     inside a recognized field like "Physical Address."
+///
+/// The colon form is checked ahead of `RE_IPV6` for exactly this reason —
+/// see the note on `RE_IPV6` and issue #13.
 static RE_MAC_COLON: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}\b").unwrap());
 
@@ -743,7 +754,8 @@ struct Cli {
     stats: bool,
 
     /// Exclude entity types from anonymization (comma-separated).
-    /// Valid types: email, user, domain, ip, naked-user, fqdn, pem, private-key, jwt
+    /// Valid types: email, user, domain, ip, ipv6, mac, ssh-fp, backup-file,
+    /// naked-user, fqdn, hostname, object, db, pem, private-key, jwt
     #[arg(
         short = 'e',
         long = "exclude",
@@ -1639,6 +1651,20 @@ fn extract_entities_of_kind(
 
     // ─── v2.4 detections ───────────────────────────────────────────
 
+    // MAC addresses (colon/hyphen format) — deliberately extracted BEFORE
+    // IPv6. A colon-separated MAC (`00:50:56:96:AA:77`) is six groups of
+    // exactly two hex digits, which is also a syntactically valid match for
+    // the loose IPv6 pattern below (2-7 groups, no strict hextet-count
+    // check). `00:50:56:...` is the VMware OUI, so a MAC with a hex letter
+    // in it is the common case in a Veeam bundle, not the exotic one — if
+    // the IPv6 channel claims it first, `--exclude mac` silently fails to
+    // preserve most real MACs (#13), and the address is masked with the
+    // IPv6 format instead of the documented MAC one. Populating
+    // `out.macs_colon` first lets the IPv6 loop below check it and back off.
+    for m in RE_MAC_COLON.find_iter(content) {
+        out.macs_colon.insert(m.as_str().to_string());
+    }
+
     // IPv6 addresses
     for m in RE_IPV6.find_iter(content) {
         let s = m.as_str();
@@ -1648,14 +1674,18 @@ fn extract_entities_of_kind(
         if !s.contains(':') {
             continue;
         }
+        // A string already claimed as a colon MAC above is unambiguous: a
+        // MAC is always exactly six groups of exactly two hex digits with no
+        // `::` compression, which no genuine IPv6 address is (an uncompressed
+        // IPv6 needs eight groups, and a compressed one contains `::`). Skip
+        // it here so it is anonymized once, via the MAC channel, with the
+        // MAC mask — and so `--exclude mac` actually preserves it.
+        if out.macs_colon.contains(s) {
+            continue;
+        }
         if should_anonymize_ipv6(s) {
             out.ipv6s.insert(s.to_string());
         }
-    }
-
-    // MAC addresses (colon/hyphen format)
-    for m in RE_MAC_COLON.find_iter(content) {
-        out.macs_colon.insert(m.as_str().to_string());
     }
 
     // MAC addresses (compact 12-hex, contextual)
@@ -5364,6 +5394,138 @@ mod tests {
             r.macs_compact.iter().any(|m| m == "005056962A77"),
             "Got: {:?}",
             r.macs_compact
+        );
+    }
+
+    /// #13: a colon MAC containing hex letters (the VMware OUI `00:50:56:...`
+    /// is the common case, not the exotic one) is also a syntactic match for
+    /// the loose IPv6 pattern. It must land in `macs_colon` only — never in
+    /// `ipv6s` — so it gets the MAC mask and `--exclude mac` can preserve it.
+    /// The all-digit MAC from the same report must land the same way, so this
+    /// isn't a regression on the case that already worked.
+    #[test]
+    fn mac_with_hex_letters_claimed_by_mac_channel_not_ipv6() {
+        let content = "hexmac 00:50:56:96:AA:77 digitmac 00:11:22:33:44:55";
+        let cfg = ExtractConfig::default();
+        let r = extract_entities(content, &cfg);
+        assert!(
+            r.macs_colon.iter().any(|m| m == "00:50:56:96:AA:77"),
+            "Got macs_colon: {:?}",
+            r.macs_colon
+        );
+        assert!(
+            r.macs_colon.iter().any(|m| m == "00:11:22:33:44:55"),
+            "Got macs_colon: {:?}",
+            r.macs_colon
+        );
+        assert!(
+            !r.ipv6s
+                .iter()
+                .any(|i| i.eq_ignore_ascii_case("00:50:56:96:AA:77")),
+            "hex-letter MAC must not also be claimed by the IPv6 channel. Got ipv6s: {:?}",
+            r.ipv6s
+        );
+        assert!(
+            r.ipv6s.is_empty(),
+            "digit-only MAC was never IPv6-shaped enough to pass should_anonymize_ipv6 \
+             anyway, so ipv6s should stay empty. Got: {:?}",
+            r.ipv6s
+        );
+    }
+
+    /// A hex-letter MAC alongside a genuine IPv6 address in the same content:
+    /// the MAC must go to the MAC channel and the real address must still be
+    /// picked up by the IPv6 channel — the fix must not turn into "nothing
+    /// with a colon and a hex letter is ever IPv6 again".
+    #[test]
+    fn mac_and_genuine_ipv6_both_detected_in_same_content() {
+        let content = "hexmac 00:50:56:96:AA:77 and address 2a01:cb05:8c57:6800:250:56ff:fe96:aa77";
+        let cfg = ExtractConfig::default();
+        let r = extract_entities(content, &cfg);
+        assert!(
+            r.macs_colon.iter().any(|m| m == "00:50:56:96:AA:77"),
+            "Got macs_colon: {:?}",
+            r.macs_colon
+        );
+        assert!(
+            r.ipv6s.iter().any(|i| i.contains("2a01:cb05")),
+            "Genuine IPv6 must still be detected. Got ipv6s: {:?}",
+            r.ipv6s
+        );
+    }
+
+    /// End-to-end: a hex-letter MAC must come out the other side wearing the
+    /// documented MAC mask (`**:**:**:**:**:XX`), not the IPv6 mask
+    /// (`****:...:XX`) it used to get when the IPv6 channel claimed it first.
+    #[test]
+    fn mac_with_hex_letters_gets_mac_mask_end_to_end() {
+        let content = "hexmac 00:50:56:96:AA:77 digitmac 00:11:22:33:44:55";
+        let cfg = ExtractConfig::default();
+        let raw = extract_entities(content, &cfg);
+        let map = build_map(raw, &ExcludeFilter::none(), &cfg);
+        let result = apply_replacements(content, &map, &ExcludeFilter::none());
+        assert!(
+            result.contains("**:**:**:**:**:77"),
+            "hex-letter MAC must get the MAC mask. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("**:**:**:**:**:55"),
+            "digit-only MAC must keep getting the MAC mask. Got: {}",
+            result
+        );
+        assert!(!result.contains("00:50:56:96:AA:77"));
+        assert!(!result.contains("00:11:22:33:44:55"));
+    }
+
+    /// `--exclude mac` must preserve a hex-letter MAC exactly like an
+    /// all-digit one — the whole point of #13. Before the fix, the
+    /// hex-letter MAC was silently anonymized anyway because it was sitting
+    /// in `ipv6s`, a set `--exclude mac` never touches.
+    #[test]
+    fn exclude_mac_preserves_hex_letter_and_digit_macs() {
+        let content = "hexmac 00:50:56:96:AA:77 digitmac 00:11:22:33:44:55";
+        let cfg = ExtractConfig::default();
+        let raw = extract_entities(content, &cfg);
+        let exclude = ExcludeFilter::from_strings(&["mac".into()]).unwrap();
+        let map = build_map(raw, &exclude, &cfg);
+        let result = apply_replacements(content, &map, &exclude);
+        assert!(
+            result.contains("00:50:56:96:AA:77"),
+            "hex-letter MAC must be preserved by --exclude mac. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("00:11:22:33:44:55"),
+            "digit-only MAC must be preserved by --exclude mac. Got: {}",
+            result
+        );
+    }
+
+    /// `--exclude ipv6` must still preserve a genuine IPv6 address, and must
+    /// have no bearing on MAC masking — the two channels stay independent.
+    #[test]
+    fn exclude_ipv6_preserves_ipv6_but_mac_is_still_masked() {
+        let content = "hexmac 00:50:56:96:AA:77 and address 2a01:cb05:8c57:6800:250:56ff:fe96:aa77";
+        let cfg = ExtractConfig::default();
+        let raw = extract_entities(content, &cfg);
+        let exclude = ExcludeFilter::from_strings(&["ipv6".into()]).unwrap();
+        let map = build_map(raw, &exclude, &cfg);
+        let result = apply_replacements(content, &map, &exclude);
+        assert!(
+            result.contains("2a01:cb05:8c57:6800:250:56ff:fe96:aa77"),
+            "--exclude ipv6 must preserve the genuine IPv6 address. Got: {}",
+            result
+        );
+        assert!(
+            !result.contains("00:50:56:96:AA:77"),
+            "MAC masking must be unaffected by --exclude ipv6. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("**:**:**:**:**:77"),
+            "MAC must still get the MAC mask. Got: {}",
+            result
         );
     }
 
