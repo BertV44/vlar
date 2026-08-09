@@ -460,6 +460,14 @@ veeam-log-anonymizer -d ./logs -o ./output -f -e ip,ipv6
 
 # Disable PEM redaction (rare — need to inspect certificate chain)
 veeam-log-anonymizer -d ./logs -o ./output -f -e pem
+
+# Keep company domains readable but still anonymize who sent what:
+# admin@acme-corp.com -> k8mN2xpQ@acme-corp.com (local part anonymized, domain kept)
+veeam-log-anonymizer -d ./logs -o ./output -f -e domain
+
+# Keep whole addresses readable but still anonymize other domains (see
+# "domain and email overlap" below for how the two flags compose)
+veeam-log-anonymizer -d ./logs -o ./output -f -e email
 ```
 
 ## Options
@@ -496,6 +504,26 @@ veeam-log-anonymizer -d ./logs -o ./output -f -e pem
 ### `--exclude` accepted types
 
 `email`, `user`, `domain`, `ip`, `ipv6`, `mac`, `ssh-fp`, `backup-file`, `naked-user`, `fqdn`, `hostname`, `object`, `db`, `pem`, `private-key`, `jwt`
+
+### `domain` and `email` overlap — how the two compose
+
+A "domain" is only ever discovered as the second half of an email address (see
+the *Domains (from emails)* row below), and the same domain string is then
+replaced everywhere it appears in the corpus — bare or not — so the same
+organization always maps to the same anonymized name. `domain` and `email`
+therefore interact:
+
+- `-e domain`: every occurrence of the domain is left alone, including the
+  domain half of an address that isn't itself excluded — e.g.
+  `admin@acme-corp.com` becomes `k8mN2xpQ@acme-corp.com` (local part
+  anonymized, domain kept), and a standalone `acme-corp.com` elsewhere in the
+  same run is left untouched too.
+- `-e email`: the entire address is preserved byte-for-byte, domain half
+  included — a half-rewritten address (original local part, randomized
+  domain) is neither anonymized nor readable, which is worse than either. A
+  domain that appears *outside* an excluded email is a separate occurrence and
+  is still anonymized, unless `domain` is excluded too.
+- `-e domain,email`: both the addresses and every domain are fully preserved.
 
 ## What gets anonymized
 

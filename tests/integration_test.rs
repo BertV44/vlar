@@ -307,6 +307,195 @@ fn exclude_email_preserves_emails() {
     );
 }
 
+// ─── #14: --exclude domain / --exclude email, and their domain overlap ───
+//
+// `domain` is only ever discovered as the second half of an email address
+// (see extract_entities_of_kind / README "Domains (from emails)"), and the
+// same domain string is then replaced everywhere it appears — bare or not —
+// so the same organization always maps to the same anonymized name. That
+// overlap is exactly what #14 tripped over: build_map's email-replacement
+// step re-manufactured a domain mapping the exclusion filter had just
+// emptied, so `-e domain` got silently undone the moment the domain also
+// showed up in an email (the ordinary case).
+
+#[test]
+fn exclude_domain_preserves_standalone_domain_seen_only_via_email() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("test.log"),
+        "mail admin@acme-corp.com\nbare acme-corp.com alone\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-i",
+        input_dir.path().join("test.log").to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--exclude",
+        "domain",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Skipped 1 domain(s) (excluded)"),
+        "the skip line should still fire: {stderr}"
+    );
+    assert!(
+        !stderr.contains("1 domains"),
+        "the \"Found:\" summary must not report a domain right after saying \
+         it was skipped — that contradiction is the #14 symptom: {stderr}"
+    );
+
+    let output = fs::read_to_string(output_dir.path().join("test.log")).unwrap();
+    assert!(
+        output.contains("bare acme-corp.com alone"),
+        "the standalone domain --exclude domain was asked to preserve must \
+         survive untouched, got: {output}"
+    );
+    assert!(
+        output.ends_with("@acme-corp.com\n") || output.contains("@acme-corp.com\n"),
+        "the domain half of the (still-anonymized) email must also be left \
+         alone once domain is excluded, got: {output}"
+    );
+    assert!(
+        !output.contains("admin@acme-corp.com"),
+        "email is NOT excluded here, so its local part must still be \
+         anonymized — only the domain half is protected, got: {output}"
+    );
+}
+
+#[test]
+fn exclude_email_preserves_whole_address_domain_still_anonymized_standalone() {
+    // Decision for #14's "related, milder" half: `-e email` preserves the
+    // entire address, local part and domain both — a half-rewritten address
+    // (local part kept, domain replaced) is neither anonymized nor readable,
+    // which is worse than either. A domain that shows up *outside* an
+    // excluded email is a separate occurrence and is still anonymized when
+    // `domain` itself isn't also excluded — the two flags stay independent.
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("test.log"),
+        "mail admin@acme-corp.com\nbare acme-corp.com alone\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-i",
+        input_dir.path().join("test.log").to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--exclude",
+        "email",
+    ]);
+    assert!(out.status.success());
+
+    let output = fs::read_to_string(output_dir.path().join("test.log")).unwrap();
+    let mut lines = output.lines();
+    let mail_line = lines.next().unwrap();
+    let bare_line = lines.next().unwrap();
+
+    assert_eq!(
+        mail_line, "mail admin@acme-corp.com",
+        "excluded email must survive byte-for-byte, including its domain half"
+    );
+    assert_ne!(
+        bare_line, "bare acme-corp.com alone",
+        "the standalone domain is a different occurrence and must still be \
+         anonymized since -e email doesn't exclude domain"
+    );
+    assert!(
+        bare_line.ends_with(".com alone"),
+        "anonymized domain should keep the .com-style shape, got: {bare_line}"
+    );
+}
+
+#[test]
+fn exclude_domain_and_email_preserves_both() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("test.log"),
+        "mail admin@acme-corp.com\nbare acme-corp.com alone\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-i",
+        input_dir.path().join("test.log").to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--exclude",
+        "domain,email",
+    ]);
+    assert!(out.status.success());
+
+    let output = fs::read_to_string(output_dir.path().join("test.log")).unwrap();
+    assert_eq!(
+        output, "mail admin@acme-corp.com\nbare acme-corp.com alone\n",
+        "combining both exclusions must fully preserve the input"
+    );
+}
+
+#[test]
+fn no_exclusion_still_anonymizes_domain_consistently_bare_and_via_email() {
+    // Baseline: with no --exclude in force, the email's domain half and the
+    // standalone occurrence of the same domain must still both be replaced,
+    // and with the *same* generated value — that consistency (STEP 1's
+    // "single source of truth") must survive the #14 fix untouched.
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("test.log"),
+        "mail admin@acme-corp.com\nbare acme-corp.com alone\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-i",
+        input_dir.path().join("test.log").to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(out.status.success());
+
+    let output = fs::read_to_string(output_dir.path().join("test.log")).unwrap();
+    assert!(
+        !output.contains("acme-corp.com"),
+        "with nothing excluded, every occurrence of the domain must be \
+         anonymized, got: {output}"
+    );
+    let mut lines = output.lines();
+    let mail_line = lines.next().unwrap();
+    let bare_line = lines.next().unwrap();
+    let mail_domain = mail_line.rsplit('@').next().unwrap();
+    let bare_domain = bare_line
+        .strip_prefix("bare ")
+        .unwrap()
+        .strip_suffix(" alone")
+        .unwrap();
+    assert_eq!(
+        mail_domain, bare_domain,
+        "the email's domain and the standalone domain must get the identical \
+         replacement: {mail_line} vs {bare_line}"
+    );
+}
+
 #[test]
 fn exclude_invalid_type_fails() {
     let input_dir = TempDir::new().unwrap();
@@ -3257,4 +3446,103 @@ fn expand_archives_survives_colliding_nested_entries() {
             "{marker} lost; got {bodies:?}"
         );
     }
+}
+
+/// `--exclude email` has to hold in file and entry *names* too. Preserving the
+/// address in the content while the file name keeps a rewritten domain half is the
+/// same half-anonymized result the exclusion exists to avoid — and the protection
+/// list was originally wired only into the content pass.
+#[test]
+fn exclude_email_preserves_the_address_in_names_too() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(
+        src.path().join("Task.admin@acme-corp.com.log"),
+        "body mentions admin@acme-corp.com\n",
+    )
+    .unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "-e",
+        "email",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let names = rel_paths(out.path());
+    assert!(
+        names.iter().any(|n| n.contains("admin@acme-corp.com")),
+        "the excluded address must survive in the file name: {names:?}"
+    );
+    let body = fs::read_to_string(out.path().join("Task.admin@acme-corp.com.log")).unwrap();
+    assert!(
+        body.contains("admin@acme-corp.com"),
+        "and in the content: {body}"
+    );
+}
+
+/// The same, for zip entry names — a third consumer of the path pairs.
+#[test]
+fn exclude_email_preserves_the_address_in_zip_entry_names() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("b.zip");
+    let out_zip = dir.path().join("anon.zip");
+    make_zip(
+        &in_zip,
+        &[("Task.admin@acme-corp.com.log", "body admin@acme-corp.com\n")],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "-e",
+        "email",
+    ]);
+    assert!(o.status.success());
+    let names: Vec<String> = read_zip(&out_zip).into_iter().map(|(n, _)| n).collect();
+    assert!(
+        names.iter().any(|n| n.contains("admin@acme-corp.com")),
+        "excluded address must survive in the entry name: {names:?}"
+    );
+}
+
+/// Without an exclusion, names are still anonymized — the protection must not leak
+/// into the ordinary path.
+#[test]
+fn names_still_anonymized_without_exclusion() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(
+        src.path().join("Task.admin@acme-corp.com.log"),
+        "x admin@acme-corp.com\n",
+    )
+    .unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(o.status.success());
+    let names = rel_paths(out.path());
+    assert!(
+        !names.iter().any(|n| n.contains("acme-corp")),
+        "names must still be anonymized when nothing is excluded: {names:?}"
+    );
 }
