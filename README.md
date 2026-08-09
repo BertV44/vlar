@@ -156,10 +156,14 @@ through the untouched IPv6 one. It also got the IPv6 mask rather than the `**:**
 this README documents. `00:50:56` is the VMware OUI, so hex-letter MACs are the norm in a Veeam
 bundle, not the exception; the all-digit case worked only by accident of having no `a`–`f` digit.
 
-The MAC channel now claims MAC-shaped strings first. The boundary is exact: a genuine IPv6 address
-either uses `::` or has eight hextets, neither of which a six-group two-hex-digit MAC can be.
-`--exclude ipv6` is unaffected, and every IPv6 form — compressed, loopback, link-local,
-IPv4-mapped — is still detected.
+The MAC channel now claims MAC-shaped strings first — but only when the six-group run stands on
+its own. A run *inside* a longer colon-separated address is the tail of an IPv6, not a MAC:
+`fd00::aa:bb:cc:dd:ee:ff` ends in six two-hex-digit groups, and claiming it would have handed the
+whole address to a channel `--exclude mac` empties, leaving it in clear. So the claim is refused
+when the match is flanked by a colon, and the IPv6 channel keeps it.
+
+`--exclude ipv6` is unaffected. Note that loopback, link-local and multicast IPv6 are deliberately
+never anonymized, as before — `fe80::1` staying visible is by design, not a gap.
 
 The `--exclude` help text also listed only 9 of the 16 types the parser accepts; it now lists all
 of them.
@@ -598,7 +602,10 @@ therefore interact:
   domain half of an address that isn't itself excluded — e.g.
   `admin@acme-corp.com` becomes `k8mN2xpQ@acme-corp.com` (local part
   anonymized, domain kept), and a standalone `acme-corp.com` elsewhere in the
-  same run is left untouched too.
+  same run is left untouched too. This holds under `--aggressive` as well: a
+  3+-segment domain such as `mail.acme-corp.com` is also an FQDN, and the FQDN
+  channel honours the exclusion rather than rewriting the standalone
+  occurrence while the address keeps it.
 - `-e email`: the entire address is preserved byte-for-byte, domain half
   included — a half-rewritten address (original local part, randomized
   domain) is neither anonymized nor readable, which is worse than either. A

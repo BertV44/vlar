@@ -1676,6 +1676,16 @@ fn extract_entities_of_kind(
     // IPv6 format instead of the documented MAC one. Populating
     // `out.macs_colon` first lets the IPv6 loop below check it and back off.
     for m in RE_MAC_COLON.find_iter(content) {
+        // A six-group run sitting inside a longer colon-separated address is the
+        // tail of an IPv6, not a MAC: `fd00::aa:bb:cc:dd:ee:ff` ends in six
+        // two-hex-digit groups. Claiming it here would take it out of the IPv6
+        // channel's hands, and `--exclude mac` would then leave the whole address
+        // in clear — a leak, and a worse one than the bug this ordering fixes.
+        let before = content[..m.start()].chars().next_back();
+        let after = content[m.end()..].chars().next();
+        if before == Some(':') || after == Some(':') {
+            continue;
+        }
         out.macs_colon.insert(m.as_str().to_string());
     }
 
@@ -1909,12 +1919,18 @@ fn build_map(
         HashSet::new()
     };
 
+    // Kept when domains are excluded so the FQDN channel below can honour the
+    // exclusion too: a 3+-segment email domain lands in both sets, and letting the
+    // FQDN pass rewrite it gives the same string two different outcomes in one run
+    // — preserved inside the address, anonymized standing alone.
+    let mut excluded_domains: HashSet<String> = HashSet::new();
     let domains = if exclude.process_domains() {
         raw.domains
     } else {
         if !raw.domains.is_empty() {
             eprintln!("  Skipped {} domain(s) (excluded)", raw.domains.len());
         }
+        excluded_domains = raw.domains;
         HashSet::new()
     };
 
@@ -1940,7 +1956,12 @@ fn build_map(
     };
 
     let fqdns = if exclude.process_fqdns() {
+        // An FQDN that is also an excluded domain has to stay excluded — see
+        // `excluded_domains`.
         raw.fqdns
+            .into_iter()
+            .filter(|f| !excluded_domains.contains(f))
+            .collect()
     } else {
         if !raw.fqdns.is_empty() {
             eprintln!("  Skipped {} FQDN(s) (excluded)", raw.fqdns.len());
@@ -3633,8 +3654,41 @@ fn paranoid_rescan(input_files: &[PathBuf], map: &AnonymizationMap, cli: &Cli) -
     let path_protect = collect_protected_literals(map);
     let output_dir = cli.require_output_dir()?;
 
+    // Spans the operator deliberately kept. An address preserved by
+    // `--exclude email` still contains its domain, and that domain is a live entry
+    // in `map.domains`, so a plain scan reports every protected address as a leak —
+    // the tool contradicting its own flag, one report further along than the bug
+    // `--exclude domain` was filed over. Blanking the protected spans before the
+    // scan keeps the automaton and its word-boundary rule untouched.
+    let protected = collect_protected_literals(map);
+    let blank_protected = |text: &str| -> String {
+        if protected.is_empty() {
+            return text.to_string();
+        }
+        // Case-insensitive, because the leak automaton is: addresses are stored
+        // lowercased, so a case-sensitive blank would miss `Admin@Acme-Corp.COM`
+        // and report it as a leak while the run had deliberately preserved it.
+        // `to_ascii_lowercase` is byte-length preserving, so offsets still line up.
+        let hay = text.to_ascii_lowercase();
+        let mut bytes = text.as_bytes().to_vec();
+        for literal in &protected {
+            let needle = literal.to_ascii_lowercase();
+            let mut from = 0;
+            while let Some(pos) = hay[from..].find(&needle) {
+                let start = from + pos;
+                for b in &mut bytes[start..start + needle.len()] {
+                    *b = b' ';
+                }
+                from = start + needle.len();
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+
     // Word-boundary leak scan helper, shared by content and path-name checks.
-    let scan_leaks = |text: &str, sink: &mut HashSet<usize>| {
+    let scan_leaks = |raw_text: &str, sink: &mut HashSet<usize>| {
+        let owned = blank_protected(raw_text);
+        let text: &str = &owned;
         let bytes = text.as_bytes();
         for mat in ac.find_iter(text) {
             // Require word-boundary on both sides to avoid matching

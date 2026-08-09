@@ -3922,3 +3922,104 @@ fn names_still_anonymized_without_exclusion() {
         "names must still be anonymized when nothing is excluded: {names:?}"
     );
 }
+
+/// Letting the MAC channel claim a six-group colon run cost an IPv6 leak: the tail
+/// of `fd00::aa:bb:cc:dd:ee:ff` is six two-hex-digit groups, so it was taken for a
+/// MAC — and `--exclude mac` then left the whole address in clear. A run sitting
+/// inside a longer colon-separated address is never a MAC.
+#[test]
+fn exclude_mac_does_not_leak_a_compressed_ipv6() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(
+        src.path().join("a.log"),
+        "v6 fd00::aa:bb:cc:dd:ee:ff mac 00:50:56:96:AA:77\n",
+    )
+    .unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "-e",
+        "mac",
+    ]);
+    assert!(o.status.success());
+    let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+    assert!(
+        !got.contains("fd00::aa:bb:cc:dd:ee:ff"),
+        "the IPv6 address must still be masked under -e mac: {got}"
+    );
+    assert!(
+        got.contains("00:50:56:96:AA:77"),
+        "and the real MAC must still be preserved: {got}"
+    );
+}
+
+/// `--paranoid` looks for original values in the output, but an address kept by
+/// `--exclude email` still contains its domain — which is a live mapping. Scanning
+/// naively made the tool report its own deliberate choice as a leak, in either
+/// letter case.
+#[test]
+fn paranoid_does_not_flag_deliberately_excluded_emails() {
+    for line in [
+        "mail admin@acme-corp.com here\n",
+        "mail Admin@Acme-Corp.COM here\n",
+    ] {
+        let src = TempDir::new().unwrap();
+        let out = TempDir::new().unwrap();
+        fs::write(src.path().join("a.log"), line).unwrap();
+
+        let o = run(&[
+            "-d",
+            src.path().to_str().unwrap(),
+            "-o",
+            out.path().to_str().unwrap(),
+            "-f",
+            "--aggressive",
+            "-e",
+            "email",
+            "--paranoid",
+        ]);
+        assert!(o.status.success());
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            !stderr.contains("PARANOID CHECK:") && !stdout.contains("PARANOID CHECK:"),
+            "preserved address reported as a leak for {line:?}: {stderr}{stdout}"
+        );
+    }
+}
+
+/// `--exclude domain` has to hold through the FQDN channel too. A 3+-segment email
+/// domain lands in both sets, and under `--aggressive` the FQDN pass rewrote the
+/// standalone occurrence while the address kept it — one string, two outcomes.
+#[test]
+fn exclude_domain_holds_through_the_fqdn_channel() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(
+        src.path().join("a.log"),
+        "a admin@mail.acme-corp.com b mail.acme-corp.com standalone\n",
+    )
+    .unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "-e",
+        "domain",
+    ]);
+    assert!(o.status.success());
+    let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+    assert!(
+        got.contains("b mail.acme-corp.com standalone"),
+        "the standalone occurrence must be preserved like the one in the address: {got}"
+    );
+}
