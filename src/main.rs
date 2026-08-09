@@ -558,6 +558,19 @@ struct AnonymizationMap {
     objects: HashMap<String, String>,
     /// Database names (from --db-list).
     dbs: HashMap<String, String>,
+    /// Emails skipped by `--exclude email`. Not a `String -> String` entry —
+    /// there is no replacement, the address must come back out unchanged — so
+    /// it lives in its own set rather than `emails`, and is deliberately left
+    /// out of `total_entities()`, the dictionary export, and the "Found:"
+    /// summary: it was skipped, not anonymized, and counting it there would
+    /// recreate the exact contradiction #14 was filed over.
+    ///
+    /// It still has to be threaded through to `apply_pairs_protected`,
+    /// though: the domain half of one of these addresses is still a domain,
+    /// and gets its own replacement the moment `domain` isn't *also*
+    /// excluded. Without this, that unrelated pass reaches into the address
+    /// and rewrites just its second half — see `apply_pairs_protected`.
+    protected_emails: HashSet<String>,
 }
 
 impl AnonymizationMap {
@@ -576,6 +589,7 @@ impl AnonymizationMap {
             hostnames: HashMap::new(),
             objects: HashMap::new(),
             dbs: HashMap::new(),
+            protected_emails: HashSet::new(),
         }
     }
 
@@ -1867,12 +1881,19 @@ fn build_map(
     extract_cfg: &ExtractConfig,
 ) -> AnonymizationMap {
     // Apply exclusion filter
+    //
+    // `protected_emails` carries the addresses this branch skips through to
+    // the map unchanged (see the field's doc comment on `AnonymizationMap`):
+    // they get no `map.emails` entry, but still need shielding from the
+    // domain pass below when `domain` isn't excluded too.
+    let mut protected_emails: HashSet<String> = HashSet::new();
     let emails = if exclude.process_emails() {
         raw.emails
     } else {
         if !raw.emails.is_empty() {
             eprintln!("  Skipped {} email(s) (excluded)", raw.emails.len());
         }
+        protected_emails = raw.emails;
         HashSet::new()
     };
 
@@ -1973,6 +1994,7 @@ fn build_map(
 
     // Build the anonymization map with domain consistency + collision detection
     let mut map = AnonymizationMap::new();
+    map.protected_emails = protected_emails;
     let mut used_domain_repls: HashSet<String> = HashSet::new();
     let mut used_email_locals: HashSet<String> = HashSet::new();
     let mut used_user_pairs: HashSet<String> = HashSet::new();
@@ -2004,17 +2026,29 @@ fn build_map(
     }
 
     // STEP 2: Generate email replacements USING existing domain mappings
+    //
+    // `domain_part` is always a member of `domains` when domains aren't
+    // excluded: `extract_entities_of_kind` adds an email's domain to
+    // `out.domains` in the very same breath as the email itself, so STEP 1 —
+    // which ran over all of `domains` before this loop started — has already
+    // inserted it. The lookup below can only miss when `--exclude domain`
+    // emptied `domains` before STEP 1 ran.
+    //
+    // The `None` arm used to paper over that by minting a brand-new random
+    // mapping and, critically, registering it in `map.domains` — which is
+    // read by every OTHER occurrence of that domain in the corpus too. So
+    // `--exclude domain` looked honoured right here (this email still got
+    // anonymized) while silently un-excluding the domain everywhere else it
+    // appeared, including standing alone (#14). Once excluded, a domain must
+    // stay out of `map.domains` for good, so the fallback now keeps the
+    // domain half of the address exactly as found instead of fabricating a
+    // mapping for it.
     for email in &emails {
         if let Some(at_pos) = email.find('@') {
             let domain_part = &email[at_pos + 1..];
-            let domain_replacement = if let Some(existing) = map.domains.get(domain_part) {
-                existing.clone()
-            } else {
-                let body = unique_random(&mut used_domain_repls, 12);
-                let new_domain = format!("{}.com", body);
-                map.domains
-                    .insert(domain_part.to_string(), new_domain.clone());
-                new_domain
+            let domain_replacement = match map.domains.get(domain_part) {
+                Some(existing) => existing.clone(),
+                None => domain_part.to_string(),
             };
             let local = unique_random(&mut used_email_locals, 8);
             let replacement = format!("{}@{}", local, domain_replacement);
@@ -2286,7 +2320,8 @@ fn apply_replacements(content: &str, map: &AnonymizationMap, exclude: &ExcludeFi
 
     // Step 5: literal replacements via Aho-Corasick
     let pairs = collect_replacement_pairs(map);
-    apply_pairs(&work, &pairs)
+    let protect = collect_protected_literals(map);
+    apply_pairs_protected(&work, &pairs, &protect)
 }
 
 /// Collect all (original, replacement) pairs from the map, sorted longest-first
@@ -2337,6 +2372,14 @@ fn collect_replacement_pairs(map: &AnonymizationMap) -> Vec<(String, String)> {
     pairs
 }
 
+/// Literal strings that must survive `apply_pairs_protected` byte-for-byte —
+/// currently just addresses skipped by `--exclude email`. See
+/// `apply_pairs_protected` for why the flat substring pass needs this list at
+/// all, rather than just leaving those addresses out of `pairs`.
+fn collect_protected_literals(map: &AnonymizationMap) -> Vec<String> {
+    map.protected_emails.iter().cloned().collect()
+}
+
 /// Collect (original, filesystem-safe replacement) pairs for anonymizing file
 /// and directory names. Covers every entity kind in the literal map; IPv4/IPv6/
 /// MAC masks (which contain `*`/`:`) and DOMAIN\user (`\`) are rendered through
@@ -2374,12 +2417,41 @@ fn to_path_safe(s: &str) -> String {
 /// Apply literal replacements using Aho-Corasick (case-insensitive, leftmost-longest).
 /// This is the single-pass engine; replacement values are never re-matched.
 fn apply_pairs(content: &str, pairs: &[(String, String)]) -> String {
-    if pairs.is_empty() {
+    apply_pairs_protected(content, pairs, &[])
+}
+
+/// Same engine as `apply_pairs`, plus a `protect` list of literal strings that
+/// must come back out byte-for-byte, even though a *shorter* pattern in
+/// `pairs` might otherwise match a piece of them.
+///
+/// This exists for `--exclude email`: the domain half of a skipped address is
+/// still a domain, and gets its own, unrelated replacement pattern the moment
+/// `domain` isn't excluded too. A flat substring pass can't tell "the domain
+/// standing alone" from "the same six characters, found starting one position
+/// after the `@` in an address we were told to leave alone" — both are just
+/// the substring `acme-corp.com`. Aho-Corasick's LeftmostLongest already
+/// breaks exactly that kind of tie by preferring the longest match at the
+/// earliest position, so registering the *whole* protected address as its own
+/// (longer, earlier-starting) pattern makes it win that race and consumes the
+/// nested domain match before it ever fires. The `None` replacement below
+/// means "copy the source through unchanged" rather than "substitute nothing"
+/// — that is what keeps the address's original case intact instead of forcing
+/// it to whatever case the pattern happened to be recorded in.
+fn apply_pairs_protected(content: &str, pairs: &[(String, String)], protect: &[String]) -> String {
+    if pairs.is_empty() && protect.is_empty() {
         return content.to_string();
     }
 
-    let patterns: Vec<&str> = pairs.iter().map(|(o, _)| o.as_str()).collect();
-    let replacements: Vec<&str> = pairs.iter().map(|(_, r)| r.as_str()).collect();
+    let mut patterns: Vec<&str> = Vec::with_capacity(pairs.len() + protect.len());
+    let mut replacements: Vec<Option<&str>> = Vec::with_capacity(pairs.len() + protect.len());
+    for (orig, anon) in pairs {
+        patterns.push(orig.as_str());
+        replacements.push(Some(anon.as_str()));
+    }
+    for literal in protect {
+        patterns.push(literal.as_str());
+        replacements.push(None);
+    }
 
     let ac = match AhoCorasickBuilder::new()
         .ascii_case_insensitive(true)
@@ -2394,12 +2466,17 @@ fn apply_pairs(content: &str, pairs: &[(String, String)]) -> String {
 }
 
 /// Helper: stream replacements through Aho-Corasick into a fresh string.
-fn ac_replace_all(ac: &AhoCorasick, haystack: &str, replacements: &[&str]) -> String {
+/// A `None` entry means "protected" — the matched span is copied through
+/// unchanged instead of substituted, preserving the source's exact case.
+fn ac_replace_all(ac: &AhoCorasick, haystack: &str, replacements: &[Option<&str>]) -> String {
     let mut out = String::with_capacity(haystack.len());
     let mut last_end = 0usize;
     for mat in ac.find_iter(haystack) {
         out.push_str(&haystack[last_end..mat.start()]);
-        out.push_str(replacements[mat.pattern().as_usize()]);
+        match replacements[mat.pattern().as_usize()] {
+            Some(r) => out.push_str(r),
+            None => out.push_str(&haystack[mat.start()..mat.end()]),
+        }
         last_end = mat.end();
     }
     out.push_str(&haystack[last_end..]);
@@ -2421,6 +2498,7 @@ fn process_files(
 
     // Path-safe replacement pairs for anonymizing file/directory names.
     let path_pairs = collect_path_replacement_pairs(map);
+    let path_protect = collect_protected_literals(map);
 
     input_files
         .par_iter()
@@ -2428,7 +2506,8 @@ fn process_files(
         .try_for_each(|input_file| -> Result<()> {
             // Compute output path (preserving subdirectory structure, with
             // sensitive entities in path names anonymized unless --keep-path-names)
-            let output_file = compute_output_path(input_file, output_dir, cli, &path_pairs);
+            let output_file =
+                compute_output_path(input_file, output_dir, cli, &path_pairs, &path_protect);
 
             // Create parent directories if needed
             if let Some(parent) = output_file.parent() {
@@ -2492,14 +2571,21 @@ fn relative_path_str(input_file: &Path, base_dir: Option<&Path>) -> String {
 /// pairs, then rebuild the path. Directory and file names are both processed.
 /// The `.log` extension and recognizable prefixes (Task./Agent./Svc.) survive
 /// because they are not entities. Returns the relative anonymized PathBuf.
-fn anonymize_relative_path(relative: &Path, path_pairs: &[(String, String)]) -> PathBuf {
-    if path_pairs.is_empty() {
+fn anonymize_relative_path(
+    relative: &Path,
+    path_pairs: &[(String, String)],
+    protect: &[String],
+) -> PathBuf {
+    if path_pairs.is_empty() && protect.is_empty() {
         return relative.to_path_buf();
     }
     let mut out = PathBuf::new();
     for component in relative.components() {
         let part = component.as_os_str().to_string_lossy();
-        let anon = apply_pairs(&part, path_pairs);
+        // An address the operator excluded has to survive here too. Preserving it
+        // in content while the file *name* keeps a rewritten domain half is the
+        // same half-anonymized result `--exclude email` exists to avoid.
+        let anon = apply_pairs_protected(&part, path_pairs, protect);
         out.push(anon);
     }
     out
@@ -2512,6 +2598,7 @@ fn compute_output_path(
     output_dir: &Path,
     cli: &Cli,
     path_pairs: &[(String, String)],
+    protect: &[String],
 ) -> PathBuf {
     // Relative path under the output directory (file name in single-file mode).
     let relative: PathBuf = if let Some(ref input_dir) = cli.input_directory {
@@ -2527,7 +2614,7 @@ fn compute_output_path(
     let relative = if cli.keep_path_names {
         relative
     } else {
-        anonymize_relative_path(&relative, path_pairs)
+        anonymize_relative_path(&relative, path_pairs, protect)
     };
 
     output_dir.join(relative)
@@ -3360,7 +3447,8 @@ fn reverse_anonymize(dict_path: &Path, input_files: &[PathBuf], cli: &Cli) -> Re
         .par_iter()
         .progress_with(anon_bar.clone())
         .try_for_each(|input_file| -> Result<()> {
-            let output_file = compute_output_path(input_file, output_dir, cli, &reverse_path_pairs);
+            let output_file =
+                compute_output_path(input_file, output_dir, cli, &reverse_path_pairs, &[]);
 
             if let Some(parent) = output_file.parent() {
                 if !parent.exists() && cli.force {
@@ -3447,6 +3535,7 @@ fn paranoid_rescan(input_files: &[PathBuf], map: &AnonymizationMap, cli: &Cli) -
 
     // Path-safe pairs are used to locate the (possibly renamed) output file.
     let path_pairs = collect_path_replacement_pairs(map);
+    let path_protect = collect_protected_literals(map);
     let output_dir = cli.require_output_dir()?;
 
     // Word-boundary leak scan helper, shared by content and path-name checks.
@@ -3470,7 +3559,8 @@ fn paranoid_rescan(input_files: &[PathBuf], map: &AnonymizationMap, cli: &Cli) -
     let total_leaks: usize = input_files
         .par_iter()
         .map(|input_file| -> usize {
-            let output_file = compute_output_path(input_file, output_dir, cli, &path_pairs);
+            let output_file =
+                compute_output_path(input_file, output_dir, cli, &path_pairs, &path_protect);
 
             // Check the output path NAME itself (file + directory components).
             // Catches sensitive tokens — e.g. short hostnames not provided via
@@ -3992,8 +4082,9 @@ fn build_validate_report(
     // real output tree name-for-name. Never persisted; it lives only for this call.
     let map = build_map(union, exclude, cfg);
     let path_pairs = collect_path_replacement_pairs(&map);
+    let path_protect = collect_protected_literals(&map);
     let anon_path = |raw: &str| -> String {
-        anonymize_relative_path(Path::new(raw), &path_pairs)
+        anonymize_relative_path(Path::new(raw), &path_pairs, &path_protect)
             .to_string_lossy()
             .into_owned()
     };
@@ -4150,8 +4241,13 @@ fn entry_is_text(name: &str) -> bool {
 }
 
 /// Anonymize a zip entry path (forward-slash separated) component-by-component.
-fn anonymize_entry_name(name: &str, pairs: &[(String, String)], keep: bool) -> String {
-    if keep || pairs.is_empty() {
+fn anonymize_entry_name(
+    name: &str,
+    pairs: &[(String, String)],
+    keep: bool,
+    protect: &[String],
+) -> String {
+    if keep || (pairs.is_empty() && protect.is_empty()) {
         return name.to_string();
     }
     name.split('/')
@@ -4159,7 +4255,10 @@ fn anonymize_entry_name(name: &str, pairs: &[(String, String)], keep: bool) -> S
             if seg.is_empty() {
                 seg.to_string()
             } else {
-                apply_pairs(seg, pairs)
+                // Same reason as `anonymize_relative_path`: an excluded address kept
+                // in the content but rewritten in the entry name would be exactly the
+                // half-anonymized result `--exclude email` exists to avoid.
+                apply_pairs_protected(seg, pairs, protect)
             }
         })
         .collect::<Vec<_>>()
@@ -4238,6 +4337,7 @@ fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i3
     }
 
     let path_pairs = collect_path_replacement_pairs(&map);
+    let path_protect = collect_protected_literals(&map);
 
     // Phase 2: write
     if let Some(out_zip) = &cli.output_zip {
@@ -4247,7 +4347,15 @@ fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i3
                 out_zip.display()
             );
         }
-        write_zip_output(&zip_path, out_zip, &map, exclude, &path_pairs, cli)?;
+        write_zip_output(
+            &zip_path,
+            out_zip,
+            &map,
+            exclude,
+            &path_pairs,
+            &path_protect,
+            cli,
+        )?;
         println!("\n  Output zip: {}", out_zip.display());
     } else {
         let out_dir = cli.require_output_dir()?;
@@ -4262,7 +4370,15 @@ fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i3
                 );
             }
         }
-        extract_zip_output(&zip_path, out_dir, &map, exclude, &path_pairs, cli)?;
+        extract_zip_output(
+            &zip_path,
+            out_dir,
+            &map,
+            exclude,
+            &path_pairs,
+            &path_protect,
+            cli,
+        )?;
         println!("\n  Output: {}", out_dir.display());
     }
 
@@ -4448,6 +4564,7 @@ fn write_zip_output(
     map: &AnonymizationMap,
     exclude: &ExcludeFilter,
     path_pairs: &[(String, String)],
+    protect: &[String],
     cli: &Cli,
 ) -> Result<()> {
     use std::io::{Read, Write};
@@ -4468,7 +4585,7 @@ fn write_zip_output(
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let name = entry.name().to_string();
-        let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names);
+        let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names, protect);
         // Repacking a traversal name unchanged would hand the attack downstream:
         // the archive going to support would itself write outside whatever
         // directory the recipient extracts it into.
@@ -4508,6 +4625,7 @@ fn extract_zip_output(
     map: &AnonymizationMap,
     exclude: &ExcludeFilter,
     path_pairs: &[(String, String)],
+    protect: &[String],
     cli: &Cli,
 ) -> Result<()> {
     use std::io::Read;
@@ -4522,7 +4640,7 @@ fn extract_zip_output(
             continue;
         }
         let name = entry.name().to_string();
-        let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names);
+        let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names, protect);
         // `out_dir.join()` happily walks out of `out_dir` when the entry name says
         // so — `../../x` lands two levels above it, and an absolute or drive-letter
         // name replaces it outright.
@@ -5103,6 +5221,123 @@ mod tests {
         assert!(result.contains("EMAIL_REPLACED"));
         assert!(result.contains("DOMAIN_REPLACED"));
         assert!(!result.contains("@company.com"));
+    }
+
+    // ── #14: --exclude domain / --exclude email ─────────
+
+    /// Engine-level check of the protection mechanism `apply_pairs_protected`
+    /// adds for #14: a literal in `protect` must win the leftmost-longest race
+    /// against a *shorter*, unrelated pattern nested inside it, and come back
+    /// out byte-for-byte — including whatever case the source used, not the
+    /// case the pattern happened to be recorded in.
+    #[test]
+    fn protected_literal_survives_nested_domain_replacement_case_and_all() {
+        let content = "mail Admin@ACME-Corp.COM and bare acme-corp.com alone";
+        let mut map = AnonymizationMap::new();
+        map.domains
+            .insert("acme-corp.com".into(), "RANDOM123xyz.com".into());
+        map.protected_emails.insert("admin@acme-corp.com".into());
+
+        let result = apply_legacy(content, &map);
+        assert!(
+            result.contains("Admin@ACME-Corp.COM"),
+            "protected email must survive verbatim, case included: {result}"
+        );
+        assert!(
+            result.contains("bare RANDOM123xyz.com alone"),
+            "the unrelated, standalone domain occurrence must still be \
+             anonymized: {result}"
+        );
+    }
+
+    /// build_map()'s STEP 2 must not resurrect a domain mapping that
+    /// `--exclude domain` emptied, just because the domain also shows up as
+    /// the second half of an email — that resurrection is the #14 bug.
+    /// `map.domains` must stay empty, and the email replacement must keep the
+    /// domain half exactly as found while still anonymizing the local part.
+    #[test]
+    fn build_map_exclude_domain_does_not_reinsert_domain_via_email() {
+        let mut raw = ExtractedEntities::default();
+        raw.emails.insert("admin@acme-corp.com".to_string());
+        raw.domains.insert("acme-corp.com".to_string());
+        let exclude = ExcludeFilter::from_strings(&["domain".into()]).unwrap();
+        let cfg = ExtractConfig::default();
+
+        let map = build_map(raw, &exclude, &cfg);
+
+        assert!(
+            map.domains.is_empty(),
+            "domain must stay excluded even though it was seen via an email, \
+             got: {:?}",
+            map.domains
+        );
+        let email_repl = map
+            .emails
+            .get("admin@acme-corp.com")
+            .expect("email itself was not excluded, so it must be anonymized");
+        assert!(
+            email_repl.ends_with("@acme-corp.com"),
+            "domain half of the address must be left exactly as found once \
+             domain is excluded, got: {email_repl}"
+        );
+        assert!(
+            !email_repl.starts_with("admin@"),
+            "local half must still be anonymized — only domain is excluded here, \
+             got: {email_repl}"
+        );
+    }
+
+    /// build_map() must record every email skipped by `--exclude email` in
+    /// `protected_emails`, so `apply_pairs_protected` can shield them later —
+    /// otherwise the domain half gets rewritten by the (unrelated, still
+    /// active) domain pass. See `protected_literal_survives_nested_domain_replacement_case_and_all`
+    /// for the mechanism this feeds.
+    #[test]
+    fn build_map_exclude_email_records_protected_emails() {
+        let mut raw = ExtractedEntities::default();
+        raw.emails.insert("admin@acme-corp.com".to_string());
+        raw.domains.insert("acme-corp.com".to_string());
+        let exclude = ExcludeFilter::from_strings(&["email".into()]).unwrap();
+        let cfg = ExtractConfig::default();
+
+        let map = build_map(raw, &exclude, &cfg);
+
+        assert!(
+            map.emails.is_empty(),
+            "excluded email must not get a map.emails entry"
+        );
+        assert!(
+            map.protected_emails.contains("admin@acme-corp.com"),
+            "excluded email must be recorded as protected so the domain pass \
+             can't reach into it, got: {:?}",
+            map.protected_emails
+        );
+        // The domain itself is not excluded, so it's still anonymized —
+        // exactly the tension #14 asked us to resolve, not to erase.
+        assert!(
+            !map.domains.is_empty(),
+            "domain is not excluded here and must still be anonymized"
+        );
+    }
+
+    /// With nothing excluded, `protected_emails` must stay empty — the
+    /// mechanism must be a no-op on the overwhelmingly common path.
+    #[test]
+    fn build_map_no_exclusion_leaves_protected_emails_empty() {
+        let mut raw = ExtractedEntities::default();
+        raw.emails.insert("admin@acme-corp.com".to_string());
+        raw.domains.insert("acme-corp.com".to_string());
+        let cfg = ExtractConfig::default();
+
+        let map = build_map(raw, &ExcludeFilter::none(), &cfg);
+
+        assert!(
+            map.protected_emails.is_empty(),
+            "no exclusion is in force, so nothing should be protected: {:?}",
+            map.protected_emails
+        );
+        assert!(!map.emails.is_empty());
+        assert!(!map.domains.is_empty());
     }
 
     /// Round-trip: anonymize then reverse must yield the original.
