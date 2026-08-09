@@ -2256,6 +2256,256 @@ fn expand_archives_two_archives_same_entry_name() {
     }
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// #15: --expand-archives must not silence coverage reporting
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Like `make_zip`, but for an entry whose content is not valid UTF-8 text —
+/// needed once an entry is itself a `.zip` file (arbitrary binary), which
+/// `make_zip`'s `&str` signature cannot carry.
+fn make_zip_bytes(path: &Path, entries: &[(&str, &[u8])]) {
+    use std::io::Write;
+    let file = fs::File::create(path).unwrap();
+    let mut zw = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, content) in entries {
+        zw.start_file(*name, opts).unwrap();
+        zw.write_all(content).unwrap();
+    }
+    zw.finish().unwrap();
+}
+
+/// `stage_with_archives` used to stage only files inside the active extension
+/// set and report nothing else, so `collect_input_files` then walked a staging
+/// root with nothing left to flag — the coverage warning vanished exactly when
+/// `--expand-archives` was turned on, even though the `.reg` was still dropped.
+/// This must read the same as a non-expanding run left out-of-set files (see
+/// `only_ext_restricts_and_reports_skipped` above for that shape without the
+/// flag): the flag changes where entries come from, not whether an out-of-set
+/// file gets named.
+#[test]
+fn expand_archives_still_reports_directory_out_of_set_files() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(src.path().join("a.log"), "alice@corp.com 10.1.1.1\n").unwrap();
+    fs::write(src.path().join("export.reg"), "host=vbr01.corp.com\n").unwrap();
+    make_zip(
+        &src.path().join("rot.zip"),
+        &[("Old.log", "bob@corp.com 10.2.2.2\n")],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("Skipped 1 file(s) with unhandled extensions") && stderr.contains(".reg"),
+        "export.reg must still be reported with --expand-archives, exactly as without it. \
+         stderr: {stderr}"
+    );
+    assert!(
+        collect_files(out.path())
+            .iter()
+            .all(|p| p.file_name().and_then(|n| n.to_str()) != Some("export.reg")),
+        "export.reg must not appear in the output — only the warning was ever missing"
+    );
+}
+
+/// The same gap one level down: an out-of-set entry found *inside* an archive
+/// being expanded must be reported too, not only an out-of-set file sitting
+/// next to the archive in the directory.
+#[test]
+fn expand_archives_reports_out_of_set_entries_inside_archive() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    make_zip(
+        &src.path().join("rot.zip"),
+        &[
+            ("Old.log", "alice@corp.com 10.1.1.1\n"),
+            ("Old.ini", "bob@corp.com 10.2.2.2\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("Skipped 1 file(s) with unhandled extensions") && stderr.contains(".ini"),
+        "an out-of-set entry inside the archive must be reported. stderr: {stderr}"
+    );
+    assert!(
+        collect_files(out.path())
+            .iter()
+            .all(|p| p.file_name().and_then(|n| n.to_str()) != Some("Old.ini")),
+        "Old.ini must not be staged or expanded — it is outside the active extension set"
+    );
+}
+
+/// A `.zip` nested inside another `.zip` — VB365 bundles nest rotated logs this
+/// way. `--expand-archives` does not recurse into it (see the comment on the
+/// nested-`.zip` branch in `stage_with_archives` for why: doing so needs to
+/// fully materialize the inner archive to get the random access `zip::ZipArchive`
+/// requires, which reopens the same amplification a streaming copy avoids).
+/// What matters here is that the gap is reported as *not covered*, not silently
+/// dropped, and that the outer archive's own text entry is unaffected.
+#[test]
+fn expand_archives_reports_zip_nested_inside_zip() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+
+    // Build the inner zip for real, then splice its raw bytes into the outer
+    // zip as a single entry — an inner zip's bytes are arbitrary binary, not
+    // text, so `make_zip`'s `&str` entries cannot carry it directly.
+    let inner_scratch = src.path().join("Inner.zip.tmp");
+    make_zip(&inner_scratch, &[("Deep.log", "carol@corp.com 10.5.5.5\n")]);
+    let inner_bytes = fs::read(&inner_scratch).unwrap();
+    fs::remove_file(&inner_scratch).unwrap();
+
+    make_zip_bytes(
+        &src.path().join("Outer.zip"),
+        &[
+            ("Level1.log", "dave@corp.com 10.6.6.6\n".as_bytes()),
+            ("Inner.zip", &inner_bytes),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+
+    // The outer archive's own text entry is expanded and anonymized as usual.
+    let level1 = out.path().join("Outer.zip.extracted").join("Level1.log");
+    assert!(level1.exists(), "Level1.log missing from expanded output");
+    let content = fs::read_to_string(&level1).unwrap();
+    assert!(
+        !content.contains("dave@corp.com") && !content.contains("10.6.6.6"),
+        "Level1.log not anonymized: {content}"
+    );
+
+    // Deep.log, inside the nested zip, must not appear anywhere — covered or
+    // not, it must not be silently dropped without a trace, and it must not
+    // leak unanonymized either.
+    assert!(
+        collect_files(out.path())
+            .iter()
+            .all(|p| p.file_name().and_then(|n| n.to_str()) != Some("Deep.log")),
+        "Deep.log must not appear in the output — it was never expanded"
+    );
+    for f in collect_files(out.path()) {
+        let c = fs::read_to_string(&f).unwrap_or_default();
+        assert!(
+            !c.contains("carol@corp.com"),
+            "content from inside the nested zip leaked unanonymized into {f:?}"
+        );
+    }
+
+    // The gap must be named and stated as uncovered, not phrased as merely
+    // "skipped" the way an out-of-set extension is — there is no --ext flag
+    // that reaches inside a second archive layer.
+    assert!(
+        stderr.contains("NOT covered"),
+        "a nested archive must be reported as not covered. stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Inner.zip"),
+        "the nested archive must be named. stderr: {stderr}"
+    );
+}
+
+/// `stage_with_archives` reports what it left behind itself; the ordinary
+/// directory walk that runs afterwards, over the staging root, must come back
+/// with nothing to add — the root never holds an out-of-set file or a `.zip` of
+/// its own. If both walks reported, the operator would see either a duplicated
+/// count or two summaries that disagree, and would have no way to tell which
+/// one to trust.
+#[test]
+fn expand_archives_coverage_report_is_not_duplicated() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(src.path().join("a.log"), "alice@corp.com\n").unwrap();
+    fs::write(src.path().join("b.reg"), "host=vbr01.corp.com\n").unwrap();
+    make_zip(
+        &src.path().join("rot.zip"),
+        &[("c.log", "bob@corp.com\n"), ("d.ini", "carol@corp.com\n")],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+
+    // One combined tally — the directory's own out-of-set file and the
+    // archive's out-of-set entry both show up in it — not one report from
+    // staging and a second, near-empty one from the walk that runs afterwards.
+    assert_eq!(
+        stderr.matches("unhandled extensions").count(),
+        1,
+        "coverage must be reported exactly once per run, not once per internal walk. \
+         stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(".reg") && stderr.contains(".ini"),
+        "both the directory file and the archive entry must appear in that one report. \
+         stderr: {stderr}"
+    );
+    // The staging root never contains a `.zip` of its own (archives are expanded,
+    // not copied), so the walk that runs the ordinary pipeline afterwards must
+    // not also claim to have found one nested inside it — that would be a second,
+    // contradictory summary in the same run.
+    assert!(
+        !stderr.contains("found inside the directory"),
+        "the staging root must not be reported as containing its own nested zip. \
+         stderr: {stderr}"
+    );
+}
+
 /// Zip input copies entries outside the extension set through byte-for-byte. That is
 /// a deliberate design choice, but it has to be reported: the directory walk warned
 /// while the zip path stayed silent, and the zip is what gets sent to support.

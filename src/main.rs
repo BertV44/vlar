@@ -2522,6 +2522,19 @@ struct StageStats {
     entries: usize,
     linked: usize,
     copied: usize,
+    /// Files left outside the active extension set, tallied by extension —
+    /// whether found directly in the directory or as an entry inside an archive
+    /// being expanded. Both end up in the same place: neither anonymized nor
+    /// written to the output. Kept together (rather than as two maps) so the
+    /// caller reports them with the same call it already had for the
+    /// non-expanding path, and the operator sees one number, not two that need
+    /// adding up by hand.
+    skipped: BTreeMap<String, usize>,
+    /// Archives found nested inside another archive being expanded, recorded as
+    /// `"<outer path>::<entry name>"`. `--expand-archives` does not recurse into
+    /// these — see `report_nested_archives` for why — so they are named instead
+    /// of silently vanishing the way they did before this field existed.
+    nested_archives: Vec<String>,
 }
 
 /// Strip a zip entry name down to safe relative components.
@@ -2643,6 +2656,14 @@ fn create_new_file(dest: &Path) -> Result<fs::File> {
 /// `<archive name>.extracted/<entry>` beside the archive. Nothing in the input is
 /// modified: the staged tree is read-only as far as this program is concerned, and
 /// hard links share an inode with the original.
+///
+/// Everything this walk decides *not* to stage — an out-of-set file, an out-of-set
+/// archive entry, an archive nested inside another archive — is tallied into the
+/// returned `StageStats` rather than dropped on the floor. The staging root only
+/// ever contains what belongs in the active extension set, so the ordinary
+/// `collect_input_files` walk that runs next, over that root, will find nothing left
+/// to report; this is the only place that still has the full picture, and the
+/// caller reports these tallies before the staged run starts (#15).
 fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
     let root = create_staging_root()?;
     let staging = StagingDir(root.clone());
@@ -2730,6 +2751,33 @@ fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
                 }
                 let name = member.name().to_string();
                 if !entry_is_text(&name) {
+                    let entry_ext = Path::new(&name)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if entry_ext == "zip" {
+                        // A `.zip` inside the `.zip` being expanded. Recursing would
+                        // need random access into an entry that only offers a
+                        // forward-only decompression stream — the only way to get
+                        // that is to fully materialize the nested archive first, in
+                        // memory or to a scratch file, which reopens exactly the
+                        // amplification the streaming copy below is careful to
+                        // avoid: two independent compression layers instead of one is
+                        // the shape a zip bomb exploits, however small the extra
+                        // depth looks. Name it and report it instead (see
+                        // `report_nested_archives`) — VB365 bundles do nest this way,
+                        // and the operator needs to know the content was never
+                        // covered, not merely that it was "skipped".
+                        stats
+                            .nested_archives
+                            .push(format!("{}::{}", rel.display(), name));
+                    } else {
+                        *stats
+                            .skipped
+                            .entry(extension_label(&entry_ext))
+                            .or_insert(0) += 1;
+                    }
                     continue;
                 }
                 // Same sanitising and collision handling the two output writers use.
@@ -2753,6 +2801,16 @@ fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
                     }
                 }
             }
+        } else {
+            // Neither staged nor an archive to expand — this is the gap #15 was
+            // filed over. `collect_input_files` runs next, but only over the
+            // staging root it just walked into being, where nothing outside the
+            // active set was ever placed; it would have nothing left to report,
+            // and the flag that exists to widen coverage would be the reason
+            // coverage looked complete when a `.reg` (or anything else out of
+            // set) was quietly missing from the output. Tally it here instead,
+            // where the file is still in view.
+            *stats.skipped.entry(extension_label(&ext)).or_insert(0) += 1;
         }
     }
 
@@ -2772,6 +2830,23 @@ enum UnhandledFate {
     /// dangerous one — an untouched text entry ships real customer data inside the
     /// file that gets sent to support — so it has to be said out loud.
     CopiedVerbatim,
+}
+
+/// Label a lowercased extension for a coverage report: `.ext`, or `(none)` for
+/// an extensionless name.
+///
+/// One function so every unhandled-extension tally — the directory walk, a
+/// `.zip` input's entries, and now the entries `--expand-archives` walks while
+/// staging — groups identically. Two call sites spelling this differently used
+/// to be exactly how a `.reg` file could show up as `.reg` in one report and
+/// `reg` or `(none)` in another, which looks like two different problems
+/// instead of the same file counted twice.
+fn extension_label(ext: &str) -> String {
+    if ext.is_empty() {
+        "(none)".to_string()
+    } else {
+        format!(".{ext}")
+    }
 }
 
 /// Report files/entries left outside the active extension set, grouped by extension.
@@ -2808,6 +2883,34 @@ fn report_unhandled_extensions(skipped: &BTreeMap<String, usize>, fate: Unhandle
     }
 }
 
+/// Report archives found nested inside another archive `--expand-archives` is
+/// expanding.
+///
+/// `--expand-archives` recurses exactly one level: the archives it finds
+/// directly inside the input directory. An archive found *inside one of those*
+/// is not expanded in turn (see the comment at the nested-`.zip` branch in
+/// `stage_with_archives` for why recursing would be more expensive than it
+/// looks), so it is named here instead. Deliberately not folded into
+/// `report_unhandled_extensions`: that function's wording is about an
+/// extension the operator can widen coverage for with `--ext`; there is no
+/// flag that reaches inside a second archive layer, so the message says so
+/// plainly rather than implying one more flag would fix it.
+fn report_nested_archives(nested: &[String]) {
+    if nested.is_empty() {
+        return;
+    }
+    eprintln!(
+        "  ⚠ {} archive(s) found nested inside an expanded archive — NOT covered:",
+        nested.len()
+    );
+    for name in nested {
+        eprintln!("      {name}");
+    }
+    eprintln!("    --expand-archives does not recurse into an archive found inside another");
+    eprintln!("    archive. This content is neither anonymized nor written to the output in");
+    eprintln!("    any form — extract it separately and re-run if it needs covering.");
+}
+
 /// Tally the zip entries that fall outside the active extension set, by extension.
 ///
 /// Reads the central directory only — no entry is decompressed.
@@ -2828,15 +2931,12 @@ fn tally_zip_unhandled(zip_path: &Path) -> Result<BTreeMap<String, usize>> {
         if entry_is_text(&name) {
             continue;
         }
-        let label = match Path::new(&name)
+        let ext = Path::new(&name)
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
-        {
-            Some(ext) => format!(".{ext}"),
-            None => "(none)".to_string(),
-        };
-        *skipped.entry(label).or_insert(0) += 1;
+            .unwrap_or_default();
+        *skipped.entry(extension_label(&ext)).or_insert(0) += 1;
     }
     Ok(skipped)
 }
@@ -2876,12 +2976,7 @@ fn collect_input_files(cli: &Cli) -> Result<Vec<PathBuf>> {
             } else if ext == "zip" {
                 archives += 1;
             } else {
-                let label = if ext.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    format!(".{ext}")
-                };
-                *skipped.entry(label).or_insert(0) += 1;
+                *skipped.entry(extension_label(&ext)).or_insert(0) += 1;
             }
         }
 
@@ -3558,6 +3653,15 @@ fn run() -> Result<i32> {
                         String::new()
                     }
                 );
+                // Report what staging itself left behind, right here, while it is
+                // still known. `collect_input_files` runs next over the staging
+                // root rather than the real input, and the root only ever holds
+                // what was in the active extension set to begin with — so its own
+                // report would always come back empty under this flag, which is
+                // the exact silence #15 was filed over: the flag that exists to
+                // improve coverage was what hid the remaining gap.
+                report_unhandled_extensions(&stats.skipped, UnhandledFate::Dropped);
+                report_nested_archives(&stats.nested_archives);
                 cli.input_directory = Some(staged.0.clone());
                 Some(staged)
             }
