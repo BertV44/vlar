@@ -144,6 +144,53 @@ left `--paranoid` reporting phantom leaks. Single-backslash escapes (`\b \f \n \
 no longer treated as `DOMAIN\user` in JSON-encoded content. Plain-text `.log` detection is
 unchanged.
 
+## What's new in v2.7.3
+
+Three defects where a flag or a report did not do what it said. All three predate v2.7.
+
+### `--exclude mac` now preserves every MAC address (#13)
+
+A colon MAC containing hex letters also satisfied the IPv6 heuristic, so it was claimed by both
+channels — and since `--exclude mac` only empties the MAC sets, the address stayed anonymized
+through the untouched IPv6 one. It also got the IPv6 mask rather than the `**:**:**:**:**:77` form
+this README documents. `00:50:56` is the VMware OUI, so hex-letter MACs are the norm in a Veeam
+bundle, not the exception; the all-digit case worked only by accident of having no `a`–`f` digit.
+
+The MAC channel now claims MAC-shaped strings first. The boundary is exact: a genuine IPv6 address
+either uses `::` or has eight hextets, neither of which a six-group two-hex-digit MAC can be.
+`--exclude ipv6` is unaffected, and every IPv6 form — compressed, loopback, link-local,
+IPv4-mapped — is still detected.
+
+The `--exclude` help text also listed only 9 of the 16 types the parser accepts; it now lists all
+of them.
+
+### `--exclude domain` is no longer undone by the email path (#14)
+
+Building an email's replacement fabricated a domain mapping and registered it — but that branch
+could only run once `--exclude domain` had emptied the map, so it existed solely to re-create the
+mapping the operator asked to skip, and it applied to *every* occurrence of that domain, not just
+the one inside the address. The run contradicted itself in its own output:
+
+```
+  Skipped 1 domain(s) (excluded)
+  Found: 1 emails, 0 users, 1 domains, ...      <- 1 domain, right after "Skipped"
+```
+
+`--exclude email` also changed: it now preserves the whole address instead of keeping the local
+part and rewriting the domain, which was neither readable nor anonymized. See
+[`domain` and `email` overlap](#domain-and-email-overlap--how-the-two-compose) for how the two
+flags compose. The protection applies to file and zip-entry names too, not only content — an
+address kept in the body while the file name carried a rewritten domain half would be the same
+half-anonymized result one step further along.
+
+### `--expand-archives` no longer silences the coverage report (#15)
+
+Passing the flag turned off the very warning that says coverage is incomplete, because staging
+places only in-set files and the walk that follows therefore found a clean floor. Staging now
+tallies what it leaves behind itself. A `.zip` nested inside an expanded archive is reported as
+**not covered** rather than vanishing. Details in the
+[`--expand-archives` section](#--expand-archives--nested-zip-archives) above.
+
 ## What's new in v2.7.2
 
 Three defects found by a QA pass over the whole tool. All three predate v2.7.
