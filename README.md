@@ -176,8 +176,19 @@ six-group run is rejected as IPv6, so `Adapter:00-50-56-96-AA-78` and `label:00:
 would ship in clear with no flags at all — and `--paranoid` cannot see that, because an entity in
 no map is in no scan list.
 
-`--exclude ipv6` is unaffected. Note that the loopback, unspecified and all-nodes addresses
-(`::1`, `::`, `ff02::1`) and `fe80::1` are deliberately left visible, as before.
+`--exclude ipv6` changes too, in the same direction: a compressed address whose tail happens to be
+six two-hex-digit groups (`fd00::aa:bb:cc:dd:ee:ff`) used to be masked *through the MAC channel*
+even with `ipv6` excluded, because the MAC channel backstopped it. It is a genuine IPv6 address, so
+`--exclude ipv6` now preserves it as asked.
+
+Note that the loopback, unspecified and all-nodes addresses (`::1`, `::`, `ff02::1`) and `fe80::1`
+are deliberately left visible, as before — a full tail such as `fe80::1234:5678:9abc:def0` is still
+masked.
+
+The invariant behind all of this is asserted directly in the test suite: every MAC-shaped match must
+end up claimed by exactly one of the two channels. Both earlier attempts at this hand-off dropped
+matches that neither channel then took, which is invisible to `--paranoid` — an entity in no map is
+in no scan list — so the property is tested rather than reasoned about.
 
 The `--exclude` help text also listed only 9 of the 16 types the parser accepts; it now lists all
 of them.

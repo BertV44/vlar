@@ -1694,25 +1694,46 @@ fn extract_entities_of_kind(
     // preserve most real MACs (#13), and the address is masked with the
     // IPv6 format instead of the documented MAC one. Populating
     // `out.macs_colon` first lets the IPv6 loop below check it and back off.
+    // Byte ranges the MAC channel actually took. The hand-off to IPv6 has to be
+    // decided per *occurrence*, not per string: the same literal can be an IPv6
+    // tail in one place and a bare MAC in another —
+    //
+    //   route fd00::aa:bb:cc:dd:ee:ff via gw
+    //   nic hwaddr aa:bb:cc:dd:ee:ff
+    //
+    // — and a set-membership check makes the second occurrence's MAC claim suppress
+    // the IPv6 channel for the first, so `--exclude mac` left both in clear.
+    let mut mac_spans: Vec<(usize, usize)> = Vec::new();
+
     for m in RE_MAC_COLON.find_iter(content) {
-        // Back off for one shape only: a match immediately preceded by `::`. That
-        // is the tail of a compressed IPv6 — `fd00::aa:bb:cc:dd:ee:ff` ends in six
-        // two-hex-digit groups — and `RE_IPV6` cannot begin a match at a hextet
-        // followed by `::`, so it captures just that tail. Claiming it as a MAC
-        // takes the address out of the IPv6 channel's hands and `--exclude mac`
-        // then leaves the whole thing in clear.
+        let matched = m.as_str();
+        // Stand aside only when the IPv6 channel will demonstrably take this match.
+        // All three conditions are load-bearing:
         //
-        // The test has to be this narrow. Backing off on *any* adjacent colon hands
-        // the match to nobody whenever the IPv6 channel would not take it either:
-        // `RE_IPV6` never matches the hyphen form, and `should_anonymize_ipv6`
-        // rejects an all-digit six-group run. `Adapter:00-50-56-96-AA-78` and
-        // `label:00:11:22:33:44:07` then ship in clear with no flags at all — a
-        // worse leak than the bug being fixed, and one `--paranoid` cannot see,
-        // since an entity in no map is in no scan list.
-        if content[..m.start()].ends_with("::") {
+        //  - it must be colon-separated, because `RE_IPV6` never matches the hyphen
+        //    form, whatever precedes it;
+        //  - it must be preceded by `::`, the one reason `RE_IPV6` captures a tail
+        //    rather than a whole address (it cannot start a match at a hextet
+        //    followed by `::`), so `fd00::aa:bb:cc:dd:ee:ff` needs the hand-off;
+        //  - `should_anonymize_ipv6` must accept it, since that is the gate the IPv6
+        //    loop applies — it rejects an all-digit six-group run, so
+        //    `fd00::00:11:22:33:44:55` would otherwise be claimed by nobody.
+        //
+        // Testing the prefix alone, or any adjacent colon, drops MACs that nothing
+        // else picks up: `Adapter:00-50-56-96-AA-78`, `::00-50-56-96-AA-61` and the
+        // C++-scope shape `Veeam::Backup::00-50-56-96-AA-66` — ordinary
+        // machine-generated trace output — then ship in clear with no flags at all,
+        // and `--paranoid` cannot see it because an entity in no map is in no scan
+        // list. Two earlier attempts here each traded one leak for another by
+        // assuming the hand-off instead of confirming it.
+        let ipv6_will_take_it = matched.contains(':')
+            && content[..m.start()].ends_with("::")
+            && should_anonymize_ipv6(matched);
+        if ipv6_will_take_it {
             continue;
         }
-        out.macs_colon.insert(m.as_str().to_string());
+        mac_spans.push((m.start(), m.end()));
+        out.macs_colon.insert(matched.to_string());
     }
 
     // IPv6 addresses
@@ -1724,13 +1745,10 @@ fn extract_entities_of_kind(
         if !s.contains(':') {
             continue;
         }
-        // A string already claimed as a colon MAC above is unambiguous: a
-        // MAC is always exactly six groups of exactly two hex digits with no
-        // `::` compression, which no genuine IPv6 address is (an uncompressed
-        // IPv6 needs eight groups, and a compressed one contains `::`). Skip
-        // it here so it is anonymized once, via the MAC channel, with the
-        // MAC mask — and so `--exclude mac` actually preserves it.
-        if out.macs_colon.contains(s) {
+        // This exact occurrence was taken by the MAC channel above, so it is
+        // anonymized once, with the documented MAC mask, and `--exclude mac`
+        // preserves it. `find_iter` yields in order, so the spans are sorted.
+        if mac_spans.binary_search(&(m.start(), m.end())).is_ok() {
             continue;
         }
         if should_anonymize_ipv6(s) {
@@ -5150,6 +5168,55 @@ mod tests {
             !plain.domain_users.is_empty(),
             "plain-text detection must be unaffected"
         );
+    }
+
+    /// The invariant the MAC/IPv6 hand-off rests on, asserted directly: every
+    /// `RE_MAC_COLON` match must end up claimed by exactly one channel. Two separate
+    /// leaks came from a guard that dropped a match from the MAC channel while
+    /// assuming the IPv6 channel would take it, and neither showed up in
+    /// shape-by-shape tests until someone happened to try that shape.
+    #[test]
+    fn every_mac_match_is_claimed_by_exactly_one_channel() {
+        let cfg = ExtractConfig {
+            aggressive: false,
+            user_list: HashSet::new(),
+            hostname_list: HashSet::new(),
+            object_list: HashSet::new(),
+            db_list: HashSet::new(),
+        };
+        let cases = [
+            "00:50:56:96:AA:77",
+            "00:11:22:33:44:55",
+            "00-50-56-96-AA-77",
+            "Adapter:00-50-56-96-AA-78",
+            "label:00:11:22:33:44:07",
+            "mac:00:50:56:96:AA:7E",
+            "::00:11:22:33:44:55",
+            "::00-50-56-96-AA-61",
+            "fd00::00:11:22:33:44:63",
+            "fd00::00-50-56-96-AA-64",
+            "Veeam::Backup::00-50-56-96-AA-66",
+            "Veeam::Net::00:11:22:33:44:67",
+            "CNetAdapter::00-50-56-96-AA-78",
+            "fd00::aa:bb:cc:dd:ee:ff",
+            "00:50:56:96:AA:02: trailing",
+        ];
+        for text in cases {
+            let out = extract_entities_of_kind(text, &cfg, ContentKind::Plain);
+            for m in RE_MAC_COLON.find_iter(text) {
+                let matched = m.as_str();
+                let as_mac = out.macs_colon.contains(matched);
+                // The IPv6 channel may claim this occurrence under a longer span, so
+                // any recorded IPv6 that contains the match counts as covering it.
+                let as_ipv6 = out.ipv6s.iter().any(|v| v.contains(matched));
+                assert!(
+                    as_mac || as_ipv6,
+                    "{matched:?} in {text:?} was claimed by neither channel — it would \
+                     ship in clear, and --paranoid cannot see it because an entity in \
+                     no map is in no scan list"
+                );
+            }
+        }
     }
 
     /// A genuine account in JSON-encoded text is written `DOMAIN\\user`, which the

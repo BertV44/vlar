@@ -4171,6 +4171,10 @@ fn ext_zip_does_not_disable_expansion() {
 fn colon_adjacent_macs_are_still_anonymized() {
     let src = TempDir::new().unwrap();
     let out = TempDir::new().unwrap();
+    // The `::`-prefixed rows are the ones a prefix-only guard drops: the hyphen
+    // form is never IPv6, and an all-digit six-group run is rejected as IPv6, so
+    // backing off on the prefix alone leaves them claimed by nobody. The
+    // C++-scope shapes are ordinary machine-generated trace output.
     let raw = concat!(
         "Adapter:00-50-56-96-AA-78 state up\n",
         "MAC:00-50-56-96-AA-01 here\n",
@@ -4178,6 +4182,13 @@ fn colon_adjacent_macs_are_still_anonymized() {
         "label:00:11:22:33:44:07 end\n",
         "00:11:22:33:44:08: trailing\n",
         "hexctx mac:00:50:56:96:AA:7E end\n",
+        "bare ::00:11:22:33:44:55 end\n",
+        "bare ::00-50-56-96-AA-61 end\n",
+        "pfx fd00::00:11:22:33:44:63 end\n",
+        "pfx fd00::00-50-56-96-AA-64 end\n",
+        "cpp Veeam::Backup::00-50-56-96-AA-66 end\n",
+        "cpp Veeam::Net::00:11:22:33:44:67 end\n",
+        "cls CNetAdapter::00-50-56-96-AA-78 end\n",
         "v6 fd00::aa:bb:cc:dd:ee:ff end\n",
     );
     fs::write(src.path().join("a.log"), raw).unwrap();
@@ -4198,6 +4209,12 @@ fn colon_adjacent_macs_are_still_anonymized() {
         "00:11:22:33:44:07",
         "00:11:22:33:44:08",
         "00:50:56:96:AA:7E",
+        "00:11:22:33:44:55",
+        "00-50-56-96-AA-61",
+        "00:11:22:33:44:63",
+        "00-50-56-96-AA-64",
+        "00-50-56-96-AA-66",
+        "00:11:22:33:44:67",
     ] {
         assert!(
             !got.contains(leaked),
