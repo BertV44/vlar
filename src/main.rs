@@ -1726,9 +1726,28 @@ fn extract_entities_of_kind(
         // and `--paranoid` cannot see it because an entity in no map is in no scan
         // list. Two earlier attempts here each traded one leak for another by
         // assuming the hand-off instead of confirming it.
-        let ipv6_will_take_it = matched.contains(':')
-            && content[..m.start()].ends_with("::")
-            && should_anonymize_ipv6(matched);
+        // Two conditions, and the second asks the IPv6 pattern directly rather than
+        // approximating it.
+        //
+        // The `::` prefix is what makes this a fragment: `RE_IPV6` needs two groups
+        // before a `::`, so it cannot start a match at `fd00` in
+        // `fd00::aa:bb:cc:dd:ee:ff` and captures only the tail — which is why the
+        // hand-off is needed there and not for a bare `00:50:56:96:AA:77`, where the
+        // MAC channel is the right owner and #13 requires it.
+        //
+        // Then: does `RE_IPV6` actually match here, and does the gate the IPv6 loop
+        // applies accept it? Proxy tests for that kept letting shapes slip. The last
+        // one — "colon-separated" — missed mixed separators, because `RE_MAC_COLON`
+        // alternates `[:-]` *per separator*: `fd00::aa-bb:cc-dd:ee-ff` contains a
+        // colon, sits after `::`, and passes the heuristic, but `RE_IPV6` cannot
+        // cross a `-`, so nothing claimed it. Asking the pattern is correct by
+        // construction; asking something that resembles it is a guess, and three
+        // guesses in a row each traded one leak for another.
+        let ipv6_will_take_it = content[..m.start()].ends_with("::")
+            && RE_IPV6
+                .find_at(content, m.start())
+                .filter(|v6| v6.start() <= m.start() && v6.end() >= m.end())
+                .is_some_and(|v6| should_anonymize_ipv6(v6.as_str()));
         if ipv6_will_take_it {
             continue;
         }
@@ -5200,6 +5219,13 @@ mod tests {
             "CNetAdapter::00-50-56-96-AA-78",
             "fd00::aa:bb:cc:dd:ee:ff",
             "00:50:56:96:AA:02: trailing",
+            // Mixed separators: RE_MAC_COLON alternates `[:-]` per separator, so
+            // these are MAC matches that RE_IPV6 can never cross.
+            "fd00::aa-bb:cc-dd:ee-ff",
+            "Veeam::Backup::00-50-56-96-AA:77",
+            "00:50-56:96-AA:33",
+            "fd00::00:50-56:96-AA:34",
+            "::aa-bb:cc-dd:ee-ff",
         ];
         for text in cases {
             let out = extract_entities_of_kind(text, &cfg, ContentKind::Plain);

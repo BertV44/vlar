@@ -165,16 +165,22 @@ through the untouched IPv6 one. It also got the IPv6 mask rather than the `**:**
 this README documents. `00:50:56` is the VMware OUI, so hex-letter MACs are the norm in a Veeam
 bundle, not the exception; the all-digit case worked only by accident of having no `a`–`f` digit.
 
-The MAC channel now claims MAC-shaped strings first, with exactly one exception: a match
-immediately preceded by `::`. That is the tail of a compressed IPv6 — `fd00::aa:bb:cc:dd:ee:ff`
-ends in six two-hex-digit groups — and claiming it would hand the whole address to a channel
-`--exclude mac` empties, leaving it in clear.
+The MAC channel now claims MAC-shaped strings first, standing aside only when two things both
+hold: the match is immediately preceded by `::`, **and** the IPv6 pattern actually matches at that
+position and passes the same gate the IPv6 pass applies.
 
-The exception has to be that narrow. Backing off on any adjacent colon gives the match to nobody
-whenever the IPv6 channel would not take it either: the hyphen form is never IPv6, and an all-digit
-six-group run is rejected as IPv6, so `Adapter:00-50-56-96-AA-78` and `label:00:11:22:33:44:07`
-would ship in clear with no flags at all — and `--paranoid` cannot see that, because an entity in
-no map is in no scan list.
+The `::` is what makes the match a fragment rather than a whole value: the IPv6 pattern needs two
+groups before a `::`, so it cannot begin at `fd00` in `fd00::aa:bb:cc:dd:ee:ff` and captures only
+the tail. That is the one case the hand-off is for. A bare `00:50:56:96:AA:77` belongs to the MAC
+channel, which is what #13 is about.
+
+The second half asks the pattern instead of approximating it, and that distinction is the whole
+lesson here. Every proxy for "IPv6 will take this" let some shape slip through to *neither* channel:
+backing off on any adjacent colon dropped `Adapter:00-50-56-96-AA-78`; backing off on the `::`
+prefix alone dropped `::00-50-56-96-AA-61` and `fd00::00:11:22:33:44:63`; adding "is
+colon-separated" still dropped `fd00::aa-bb:cc-dd:ee-ff`, because the MAC pattern alternates `:`
+and `-` *per separator* while the IPv6 pattern cannot cross a `-`. Each of those shipped in clear
+with no flags — and `--paranoid` cannot see it, because an entity in no map is in no scan list.
 
 `--exclude ipv6` changes too, in the same direction: a compressed address whose tail happens to be
 six two-hex-digit groups (`fd00::aa:bb:cc:dd:ee:ff`) used to be masked *through the MAC channel*
@@ -185,10 +191,11 @@ Note that the loopback, unspecified and all-nodes addresses (`::1`, `::`, `ff02:
 are deliberately left visible, as before — a full tail such as `fe80::1234:5678:9abc:def0` is still
 masked.
 
-The invariant behind all of this is asserted directly in the test suite: every MAC-shaped match must
-end up claimed by exactly one of the two channels. Both earlier attempts at this hand-off dropped
-matches that neither channel then took, which is invisible to `--paranoid` — an entity in no map is
-in no scan list — so the property is tested rather than reasoned about.
+The invariant behind all of this is asserted directly in the test suite: no MAC-shaped match may end
+up claimed by *neither* channel. (Both claiming it is allowed and harmless — it means the value is
+masked twice over.) Three attempts at this hand-off each dropped a different shape, and none of them
+showed up in a shape-by-shape corpus until someone tried that shape, so the property is asserted
+rather than reasoned about — the test is verified to fail on each of the earlier versions.
 
 The `--exclude` help text also listed only 9 of the 16 types the parser accepts; it now lists all
 of them.
