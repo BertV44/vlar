@@ -157,7 +157,7 @@ unchanged.
 
 Three defects where a flag or a report did not do what it said. All three predate v2.7.
 
-### `--exclude mac` now preserves every MAC address (#13)
+### `--exclude mac` now preserves MAC addresses with hex letters (#13)
 
 A colon MAC containing hex letters also satisfied the IPv6 heuristic, so it was claimed by both
 channels — and since `--exclude mac` only empties the MAC sets, the address stayed anonymized
@@ -165,14 +165,19 @@ through the untouched IPv6 one. It also got the IPv6 mask rather than the `**:**
 this README documents. `00:50:56` is the VMware OUI, so hex-letter MACs are the norm in a Veeam
 bundle, not the exception; the all-digit case worked only by accident of having no `a`–`f` digit.
 
-The MAC channel now claims MAC-shaped strings first — but only when the six-group run stands on
-its own. A run *inside* a longer colon-separated address is the tail of an IPv6, not a MAC:
-`fd00::aa:bb:cc:dd:ee:ff` ends in six two-hex-digit groups, and claiming it would have handed the
-whole address to a channel `--exclude mac` empties, leaving it in clear. So the claim is refused
-when the match is flanked by a colon, and the IPv6 channel keeps it.
+The MAC channel now claims MAC-shaped strings first, with exactly one exception: a match
+immediately preceded by `::`. That is the tail of a compressed IPv6 — `fd00::aa:bb:cc:dd:ee:ff`
+ends in six two-hex-digit groups — and claiming it would hand the whole address to a channel
+`--exclude mac` empties, leaving it in clear.
 
-`--exclude ipv6` is unaffected. Note that loopback, link-local and multicast IPv6 are deliberately
-never anonymized, as before — `fe80::1` staying visible is by design, not a gap.
+The exception has to be that narrow. Backing off on any adjacent colon gives the match to nobody
+whenever the IPv6 channel would not take it either: the hyphen form is never IPv6, and an all-digit
+six-group run is rejected as IPv6, so `Adapter:00-50-56-96-AA-78` and `label:00:11:22:33:44:07`
+would ship in clear with no flags at all — and `--paranoid` cannot see that, because an entity in
+no map is in no scan list.
+
+`--exclude ipv6` is unaffected. Note that the loopback, unspecified and all-nodes addresses
+(`::1`, `::`, `ff02::1`) and `fe80::1` are deliberately left visible, as before.
 
 The `--exclude` help text also listed only 9 of the 16 types the parser accepts; it now lists all
 of them.

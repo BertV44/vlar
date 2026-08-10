@@ -1695,14 +1695,21 @@ fn extract_entities_of_kind(
     // IPv6 format instead of the documented MAC one. Populating
     // `out.macs_colon` first lets the IPv6 loop below check it and back off.
     for m in RE_MAC_COLON.find_iter(content) {
-        // A six-group run sitting inside a longer colon-separated address is the
-        // tail of an IPv6, not a MAC: `fd00::aa:bb:cc:dd:ee:ff` ends in six
-        // two-hex-digit groups. Claiming it here would take it out of the IPv6
-        // channel's hands, and `--exclude mac` would then leave the whole address
-        // in clear — a leak, and a worse one than the bug this ordering fixes.
-        let before = content[..m.start()].chars().next_back();
-        let after = content[m.end()..].chars().next();
-        if before == Some(':') || after == Some(':') {
+        // Back off for one shape only: a match immediately preceded by `::`. That
+        // is the tail of a compressed IPv6 — `fd00::aa:bb:cc:dd:ee:ff` ends in six
+        // two-hex-digit groups — and `RE_IPV6` cannot begin a match at a hextet
+        // followed by `::`, so it captures just that tail. Claiming it as a MAC
+        // takes the address out of the IPv6 channel's hands and `--exclude mac`
+        // then leaves the whole thing in clear.
+        //
+        // The test has to be this narrow. Backing off on *any* adjacent colon hands
+        // the match to nobody whenever the IPv6 channel would not take it either:
+        // `RE_IPV6` never matches the hyphen form, and `should_anonymize_ipv6`
+        // rejects an all-digit six-group run. `Adapter:00-50-56-96-AA-78` and
+        // `label:00:11:22:33:44:07` then ship in clear with no flags at all — a
+        // worse leak than the bug being fixed, and one `--paranoid` cannot see,
+        // since an entity in no map is in no scan list.
+        if content[..m.start()].ends_with("::") {
             continue;
         }
         out.macs_colon.insert(m.as_str().to_string());

@@ -4161,3 +4161,89 @@ fn ext_zip_does_not_disable_expansion() {
         );
     }
 }
+
+/// Backing off from a MAC claim on *any* adjacent colon hands the match to nobody
+/// whenever the IPv6 channel would not take it either: RE_IPV6 never matches the
+/// hyphen form, and an all-digit six-group run is rejected as IPv6. Those MACs then
+/// shipped in clear with no flags at all — and --paranoid could not see it, since
+/// an entity in no map is in no scan list. Only a `::` prefix means "IPv6 tail".
+#[test]
+fn colon_adjacent_macs_are_still_anonymized() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let raw = concat!(
+        "Adapter:00-50-56-96-AA-78 state up\n",
+        "MAC:00-50-56-96-AA-01 here\n",
+        "00-50-56-96-AA-02: link up\n",
+        "label:00:11:22:33:44:07 end\n",
+        "00:11:22:33:44:08: trailing\n",
+        "hexctx mac:00:50:56:96:AA:7E end\n",
+        "v6 fd00::aa:bb:cc:dd:ee:ff end\n",
+    );
+    fs::write(src.path().join("a.log"), raw).unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(o.status.success());
+    let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+    for leaked in [
+        "00-50-56-96-AA-78",
+        "00-50-56-96-AA-01",
+        "00-50-56-96-AA-02",
+        "00:11:22:33:44:07",
+        "00:11:22:33:44:08",
+        "00:50:56:96:AA:7E",
+    ] {
+        assert!(
+            !got.contains(leaked),
+            "{leaked} shipped in clear with no flags: {got}"
+        );
+    }
+    assert!(
+        !got.contains("fd00::aa:bb:cc:dd:ee:ff"),
+        "the compressed IPv6 must still be masked: {got}"
+    );
+}
+
+/// And `--exclude mac` must preserve all of those shapes — including the
+/// colon-adjacent hex-letter MAC, which is what #13 was filed about.
+#[test]
+fn exclude_mac_preserves_colon_adjacent_shapes() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let raw = concat!(
+        "Adapter:00-50-56-96-AA-78 up\n",
+        "label:00:11:22:33:44:07 end\n",
+        "hexctx mac:00:50:56:96:AA:7E end\n",
+        "v6 fd00::aa:bb:cc:dd:ee:ff end\n",
+    );
+    fs::write(src.path().join("a.log"), raw).unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "-e",
+        "mac",
+    ]);
+    assert!(o.status.success());
+    let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+    for kept in [
+        "00-50-56-96-AA-78",
+        "00:11:22:33:44:07",
+        "00:50:56:96:AA:7E",
+    ] {
+        assert!(got.contains(kept), "-e mac must preserve {kept}: {got}");
+    }
+    assert!(
+        !got.contains("fd00::aa:bb:cc:dd:ee:ff"),
+        "but the IPv6 must still be masked: {got}"
+    );
+}
