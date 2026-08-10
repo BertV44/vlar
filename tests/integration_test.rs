@@ -307,6 +307,195 @@ fn exclude_email_preserves_emails() {
     );
 }
 
+// ─── #14: --exclude domain / --exclude email, and their domain overlap ───
+//
+// `domain` is only ever discovered as the second half of an email address
+// (see extract_entities_of_kind / README "Domains (from emails)"), and the
+// same domain string is then replaced everywhere it appears — bare or not —
+// so the same organization always maps to the same anonymized name. That
+// overlap is exactly what #14 tripped over: build_map's email-replacement
+// step re-manufactured a domain mapping the exclusion filter had just
+// emptied, so `-e domain` got silently undone the moment the domain also
+// showed up in an email (the ordinary case).
+
+#[test]
+fn exclude_domain_preserves_standalone_domain_seen_only_via_email() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("test.log"),
+        "mail admin@acme-corp.com\nbare acme-corp.com alone\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-i",
+        input_dir.path().join("test.log").to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--exclude",
+        "domain",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Skipped 1 domain(s) (excluded)"),
+        "the skip line should still fire: {stderr}"
+    );
+    assert!(
+        !stderr.contains("1 domains"),
+        "the \"Found:\" summary must not report a domain right after saying \
+         it was skipped — that contradiction is the #14 symptom: {stderr}"
+    );
+
+    let output = fs::read_to_string(output_dir.path().join("test.log")).unwrap();
+    assert!(
+        output.contains("bare acme-corp.com alone"),
+        "the standalone domain --exclude domain was asked to preserve must \
+         survive untouched, got: {output}"
+    );
+    assert!(
+        output.ends_with("@acme-corp.com\n") || output.contains("@acme-corp.com\n"),
+        "the domain half of the (still-anonymized) email must also be left \
+         alone once domain is excluded, got: {output}"
+    );
+    assert!(
+        !output.contains("admin@acme-corp.com"),
+        "email is NOT excluded here, so its local part must still be \
+         anonymized — only the domain half is protected, got: {output}"
+    );
+}
+
+#[test]
+fn exclude_email_preserves_whole_address_domain_still_anonymized_standalone() {
+    // Decision for #14's "related, milder" half: `-e email` preserves the
+    // entire address, local part and domain both — a half-rewritten address
+    // (local part kept, domain replaced) is neither anonymized nor readable,
+    // which is worse than either. A domain that shows up *outside* an
+    // excluded email is a separate occurrence and is still anonymized when
+    // `domain` itself isn't also excluded — the two flags stay independent.
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("test.log"),
+        "mail admin@acme-corp.com\nbare acme-corp.com alone\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-i",
+        input_dir.path().join("test.log").to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--exclude",
+        "email",
+    ]);
+    assert!(out.status.success());
+
+    let output = fs::read_to_string(output_dir.path().join("test.log")).unwrap();
+    let mut lines = output.lines();
+    let mail_line = lines.next().unwrap();
+    let bare_line = lines.next().unwrap();
+
+    assert_eq!(
+        mail_line, "mail admin@acme-corp.com",
+        "excluded email must survive byte-for-byte, including its domain half"
+    );
+    assert_ne!(
+        bare_line, "bare acme-corp.com alone",
+        "the standalone domain is a different occurrence and must still be \
+         anonymized since -e email doesn't exclude domain"
+    );
+    assert!(
+        bare_line.ends_with(".com alone"),
+        "anonymized domain should keep the .com-style shape, got: {bare_line}"
+    );
+}
+
+#[test]
+fn exclude_domain_and_email_preserves_both() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("test.log"),
+        "mail admin@acme-corp.com\nbare acme-corp.com alone\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-i",
+        input_dir.path().join("test.log").to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "--exclude",
+        "domain,email",
+    ]);
+    assert!(out.status.success());
+
+    let output = fs::read_to_string(output_dir.path().join("test.log")).unwrap();
+    assert_eq!(
+        output, "mail admin@acme-corp.com\nbare acme-corp.com alone\n",
+        "combining both exclusions must fully preserve the input"
+    );
+}
+
+#[test]
+fn no_exclusion_still_anonymizes_domain_consistently_bare_and_via_email() {
+    // Baseline: with no --exclude in force, the email's domain half and the
+    // standalone occurrence of the same domain must still both be replaced,
+    // and with the *same* generated value — that consistency (STEP 1's
+    // "single source of truth") must survive the #14 fix untouched.
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("test.log"),
+        "mail admin@acme-corp.com\nbare acme-corp.com alone\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-i",
+        input_dir.path().join("test.log").to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(out.status.success());
+
+    let output = fs::read_to_string(output_dir.path().join("test.log")).unwrap();
+    assert!(
+        !output.contains("acme-corp.com"),
+        "with nothing excluded, every occurrence of the domain must be \
+         anonymized, got: {output}"
+    );
+    let mut lines = output.lines();
+    let mail_line = lines.next().unwrap();
+    let bare_line = lines.next().unwrap();
+    let mail_domain = mail_line.rsplit('@').next().unwrap();
+    let bare_domain = bare_line
+        .strip_prefix("bare ")
+        .unwrap()
+        .strip_suffix(" alone")
+        .unwrap();
+    assert_eq!(
+        mail_domain, bare_domain,
+        "the email's domain and the standalone domain must get the identical \
+         replacement: {mail_line} vs {bare_line}"
+    );
+}
+
 #[test]
 fn exclude_invalid_type_fails() {
     let input_dir = TempDir::new().unwrap();
@@ -898,6 +1087,132 @@ fn mac_address_anonymized() {
         anonymized
     );
     assert!(!anonymized.contains("005056962A77"), "Compact MAC must go");
+}
+
+/// #13: `00:50:56:...` is the VMware OUI, so a colon MAC with a hex letter
+/// is the common case in a Veeam bundle, not the exotic one. It used to be
+/// claimed by the IPv6 channel (which `--exclude mac` never touches), so it
+/// got masked with the IPv6 format and survived `-e mac` intact. Reproduces
+/// the exact report from the issue: with `-e mac`, both the hex-letter MAC
+/// and the all-digit MAC must survive untouched.
+#[test]
+fn exclude_mac_preserves_hex_letter_mac() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("a.log"),
+        "hexmac 00:50:56:96:AA:77 digitmac 00:11:22:33:44:55\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "-e",
+        "mac",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let anonymized = fs::read_to_string(output_dir.path().join("a.log")).unwrap();
+    assert!(
+        anonymized.contains("00:50:56:96:AA:77"),
+        "-e mac must preserve a MAC with hex letters. Got: {}",
+        anonymized
+    );
+    assert!(
+        anonymized.contains("00:11:22:33:44:55"),
+        "-e mac must still preserve an all-digit MAC. Got: {}",
+        anonymized
+    );
+}
+
+/// Without `--exclude`, a colon MAC containing hex letters must come out
+/// wearing the documented MAC mask (`**:**:**:**:**:XX`) rather than the
+/// IPv6 mask it used to get when the IPv6 channel claimed it first.
+#[test]
+fn hex_letter_mac_gets_mac_mask_by_default() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("a.log"),
+        "hexmac 00:50:56:96:AA:77 digitmac 00:11:22:33:44:55\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let anonymized = fs::read_to_string(output_dir.path().join("a.log")).unwrap();
+    assert!(
+        anonymized.contains("**:**:**:**:**:77"),
+        "hex-letter MAC must get the MAC mask, not the IPv6 mask. Got: {}",
+        anonymized
+    );
+    assert!(
+        anonymized.contains("**:**:**:**:**:55"),
+        "all-digit MAC must keep getting the MAC mask. Got: {}",
+        anonymized
+    );
+    assert!(!anonymized.contains("00:50:56:96:AA:77"));
+    assert!(!anonymized.contains("00:11:22:33:44:55"));
+}
+
+/// `--exclude ipv6` alone must still preserve a genuine IPv6 address, and a
+/// colon MAC elsewhere in the same file must still be masked — the two
+/// channels stay independent after the #13 fix.
+#[test]
+fn exclude_ipv6_preserves_ipv6_and_mac_still_masked() {
+    let input_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+
+    fs::write(
+        input_dir.path().join("a.log"),
+        "hexmac 00:50:56:96:AA:77 addr 2a01:cb05:8c57:6800:250:56ff:fe96:aa77\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "-d",
+        input_dir.path().to_str().unwrap(),
+        "-o",
+        output_dir.path().to_str().unwrap(),
+        "-f",
+        "-e",
+        "ipv6",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let anonymized = fs::read_to_string(output_dir.path().join("a.log")).unwrap();
+    assert!(
+        anonymized.contains("2a01:cb05:8c57:6800:250:56ff:fe96:aa77"),
+        "-e ipv6 must preserve the genuine IPv6 address. Got: {}",
+        anonymized
+    );
+    assert!(
+        !anonymized.contains("00:50:56:96:AA:77"),
+        "MAC must still be masked when only ipv6 is excluded. Got: {}",
+        anonymized
+    );
 }
 
 #[test]
@@ -2256,6 +2571,256 @@ fn expand_archives_two_archives_same_entry_name() {
     }
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// #15: --expand-archives must not silence coverage reporting
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Like `make_zip`, but for an entry whose content is not valid UTF-8 text —
+/// needed once an entry is itself a `.zip` file (arbitrary binary), which
+/// `make_zip`'s `&str` signature cannot carry.
+fn make_zip_bytes(path: &Path, entries: &[(&str, &[u8])]) {
+    use std::io::Write;
+    let file = fs::File::create(path).unwrap();
+    let mut zw = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, content) in entries {
+        zw.start_file(*name, opts).unwrap();
+        zw.write_all(content).unwrap();
+    }
+    zw.finish().unwrap();
+}
+
+/// `stage_with_archives` used to stage only files inside the active extension
+/// set and report nothing else, so `collect_input_files` then walked a staging
+/// root with nothing left to flag — the coverage warning vanished exactly when
+/// `--expand-archives` was turned on, even though the `.reg` was still dropped.
+/// This must read the same as a non-expanding run left out-of-set files (see
+/// `only_ext_restricts_and_reports_skipped` above for that shape without the
+/// flag): the flag changes where entries come from, not whether an out-of-set
+/// file gets named.
+#[test]
+fn expand_archives_still_reports_directory_out_of_set_files() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(src.path().join("a.log"), "alice@corp.com 10.1.1.1\n").unwrap();
+    fs::write(src.path().join("export.reg"), "host=vbr01.corp.com\n").unwrap();
+    make_zip(
+        &src.path().join("rot.zip"),
+        &[("Old.log", "bob@corp.com 10.2.2.2\n")],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("Skipped 1 file(s) with unhandled extensions") && stderr.contains(".reg"),
+        "export.reg must still be reported with --expand-archives, exactly as without it. \
+         stderr: {stderr}"
+    );
+    assert!(
+        collect_files(out.path())
+            .iter()
+            .all(|p| p.file_name().and_then(|n| n.to_str()) != Some("export.reg")),
+        "export.reg must not appear in the output — only the warning was ever missing"
+    );
+}
+
+/// The same gap one level down: an out-of-set entry found *inside* an archive
+/// being expanded must be reported too, not only an out-of-set file sitting
+/// next to the archive in the directory.
+#[test]
+fn expand_archives_reports_out_of_set_entries_inside_archive() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    make_zip(
+        &src.path().join("rot.zip"),
+        &[
+            ("Old.log", "alice@corp.com 10.1.1.1\n"),
+            ("Old.ini", "bob@corp.com 10.2.2.2\n"),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("Skipped 1 file(s) with unhandled extensions") && stderr.contains(".ini"),
+        "an out-of-set entry inside the archive must be reported. stderr: {stderr}"
+    );
+    assert!(
+        collect_files(out.path())
+            .iter()
+            .all(|p| p.file_name().and_then(|n| n.to_str()) != Some("Old.ini")),
+        "Old.ini must not be staged or expanded — it is outside the active extension set"
+    );
+}
+
+/// A `.zip` nested inside another `.zip` — VB365 bundles nest rotated logs this
+/// way. `--expand-archives` does not recurse into it (see the comment on the
+/// nested-`.zip` branch in `stage_with_archives` for why: doing so needs to
+/// fully materialize the inner archive to get the random access `zip::ZipArchive`
+/// requires, which reopens the same amplification a streaming copy avoids).
+/// What matters here is that the gap is reported as *not covered*, not silently
+/// dropped, and that the outer archive's own text entry is unaffected.
+#[test]
+fn expand_archives_reports_zip_nested_inside_zip() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+
+    // Build the inner zip for real, then splice its raw bytes into the outer
+    // zip as a single entry — an inner zip's bytes are arbitrary binary, not
+    // text, so `make_zip`'s `&str` entries cannot carry it directly.
+    let inner_scratch = src.path().join("Inner.zip.tmp");
+    make_zip(&inner_scratch, &[("Deep.log", "carol@corp.com 10.5.5.5\n")]);
+    let inner_bytes = fs::read(&inner_scratch).unwrap();
+    fs::remove_file(&inner_scratch).unwrap();
+
+    make_zip_bytes(
+        &src.path().join("Outer.zip"),
+        &[
+            ("Level1.log", "dave@corp.com 10.6.6.6\n".as_bytes()),
+            ("Inner.zip", &inner_bytes),
+        ],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+
+    // The outer archive's own text entry is expanded and anonymized as usual.
+    let level1 = out.path().join("Outer.zip.extracted").join("Level1.log");
+    assert!(level1.exists(), "Level1.log missing from expanded output");
+    let content = fs::read_to_string(&level1).unwrap();
+    assert!(
+        !content.contains("dave@corp.com") && !content.contains("10.6.6.6"),
+        "Level1.log not anonymized: {content}"
+    );
+
+    // Deep.log, inside the nested zip, must not appear anywhere — covered or
+    // not, it must not be silently dropped without a trace, and it must not
+    // leak unanonymized either.
+    assert!(
+        collect_files(out.path())
+            .iter()
+            .all(|p| p.file_name().and_then(|n| n.to_str()) != Some("Deep.log")),
+        "Deep.log must not appear in the output — it was never expanded"
+    );
+    for f in collect_files(out.path()) {
+        let c = fs::read_to_string(&f).unwrap_or_default();
+        assert!(
+            !c.contains("carol@corp.com"),
+            "content from inside the nested zip leaked unanonymized into {f:?}"
+        );
+    }
+
+    // The gap must be named and stated as uncovered, not phrased as merely
+    // "skipped" the way an out-of-set extension is — there is no --ext flag
+    // that reaches inside a second archive layer.
+    assert!(
+        stderr.contains("NOT covered"),
+        "a nested archive must be reported as not covered. stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Inner.zip"),
+        "the nested archive must be named. stderr: {stderr}"
+    );
+}
+
+/// `stage_with_archives` reports what it left behind itself; the ordinary
+/// directory walk that runs afterwards, over the staging root, must come back
+/// with nothing to add — the root never holds an out-of-set file or a `.zip` of
+/// its own. If both walks reported, the operator would see either a duplicated
+/// count or two summaries that disagree, and would have no way to tell which
+/// one to trust.
+#[test]
+fn expand_archives_coverage_report_is_not_duplicated() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(src.path().join("a.log"), "alice@corp.com\n").unwrap();
+    fs::write(src.path().join("b.reg"), "host=vbr01.corp.com\n").unwrap();
+    make_zip(
+        &src.path().join("rot.zip"),
+        &[("c.log", "bob@corp.com\n"), ("d.ini", "carol@corp.com\n")],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "--expand-archives",
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+
+    // One combined tally — the directory's own out-of-set file and the
+    // archive's out-of-set entry both show up in it — not one report from
+    // staging and a second, near-empty one from the walk that runs afterwards.
+    assert_eq!(
+        stderr.matches("unhandled extensions").count(),
+        1,
+        "coverage must be reported exactly once per run, not once per internal walk. \
+         stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(".reg") && stderr.contains(".ini"),
+        "both the directory file and the archive entry must appear in that one report. \
+         stderr: {stderr}"
+    );
+    // The staging root never contains a `.zip` of its own (archives are expanded,
+    // not copied), so the walk that runs the ordinary pipeline afterwards must
+    // not also claim to have found one nested inside it — that would be a second,
+    // contradictory summary in the same run.
+    assert!(
+        !stderr.contains("found inside the directory"),
+        "the staging root must not be reported as containing its own nested zip. \
+         stderr: {stderr}"
+    );
+}
+
 /// Zip input copies entries outside the extension set through byte-for-byte. That is
 /// a deliberate design choice, but it has to be reported: the directory walk warned
 /// while the zip path stayed silent, and the zip is what gets sent to support.
@@ -3257,4 +3822,445 @@ fn expand_archives_survives_colliding_nested_entries() {
             "{marker} lost; got {bodies:?}"
         );
     }
+}
+
+/// `--exclude email` has to hold in file and entry *names* too. Preserving the
+/// address in the content while the file name keeps a rewritten domain half is the
+/// same half-anonymized result the exclusion exists to avoid — and the protection
+/// list was originally wired only into the content pass.
+#[test]
+fn exclude_email_preserves_the_address_in_names_too() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(
+        src.path().join("Task.admin@acme-corp.com.log"),
+        "body mentions admin@acme-corp.com\n",
+    )
+    .unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "-e",
+        "email",
+    ]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let names = rel_paths(out.path());
+    assert!(
+        names.iter().any(|n| n.contains("admin@acme-corp.com")),
+        "the excluded address must survive in the file name: {names:?}"
+    );
+    let body = fs::read_to_string(out.path().join("Task.admin@acme-corp.com.log")).unwrap();
+    assert!(
+        body.contains("admin@acme-corp.com"),
+        "and in the content: {body}"
+    );
+}
+
+/// The same, for zip entry names — a third consumer of the path pairs.
+#[test]
+fn exclude_email_preserves_the_address_in_zip_entry_names() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("b.zip");
+    let out_zip = dir.path().join("anon.zip");
+    make_zip(
+        &in_zip,
+        &[("Task.admin@acme-corp.com.log", "body admin@acme-corp.com\n")],
+    );
+
+    let o = run(&[
+        "-d",
+        in_zip.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "-e",
+        "email",
+    ]);
+    assert!(o.status.success());
+    let names: Vec<String> = read_zip(&out_zip).into_iter().map(|(n, _)| n).collect();
+    assert!(
+        names.iter().any(|n| n.contains("admin@acme-corp.com")),
+        "excluded address must survive in the entry name: {names:?}"
+    );
+}
+
+/// Without an exclusion, names are still anonymized — the protection must not leak
+/// into the ordinary path.
+#[test]
+fn names_still_anonymized_without_exclusion() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(
+        src.path().join("Task.admin@acme-corp.com.log"),
+        "x admin@acme-corp.com\n",
+    )
+    .unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(o.status.success());
+    let names = rel_paths(out.path());
+    assert!(
+        !names.iter().any(|n| n.contains("acme-corp")),
+        "names must still be anonymized when nothing is excluded: {names:?}"
+    );
+}
+
+/// Letting the MAC channel claim a six-group colon run cost an IPv6 leak: the tail
+/// of `fd00::aa:bb:cc:dd:ee:ff` is six two-hex-digit groups, so it was taken for a
+/// MAC — and `--exclude mac` then left the whole address in clear. A run sitting
+/// inside a longer colon-separated address is never a MAC.
+#[test]
+fn exclude_mac_does_not_leak_a_compressed_ipv6() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(
+        src.path().join("a.log"),
+        "v6 fd00::aa:bb:cc:dd:ee:ff mac 00:50:56:96:AA:77\n",
+    )
+    .unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "-e",
+        "mac",
+    ]);
+    assert!(o.status.success());
+    let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+    assert!(
+        !got.contains("fd00::aa:bb:cc:dd:ee:ff"),
+        "the IPv6 address must still be masked under -e mac: {got}"
+    );
+    assert!(
+        got.contains("00:50:56:96:AA:77"),
+        "and the real MAC must still be preserved: {got}"
+    );
+}
+
+/// `--paranoid` looks for original values in the output, but an address kept by
+/// `--exclude email` still contains its domain — which is a live mapping. Scanning
+/// naively made the tool report its own deliberate choice as a leak, in either
+/// letter case.
+#[test]
+fn paranoid_does_not_flag_deliberately_excluded_emails() {
+    for line in [
+        "mail admin@acme-corp.com here\n",
+        "mail Admin@Acme-Corp.COM here\n",
+    ] {
+        let src = TempDir::new().unwrap();
+        let out = TempDir::new().unwrap();
+        fs::write(src.path().join("a.log"), line).unwrap();
+
+        let o = run(&[
+            "-d",
+            src.path().to_str().unwrap(),
+            "-o",
+            out.path().to_str().unwrap(),
+            "-f",
+            "--aggressive",
+            "-e",
+            "email",
+            "--paranoid",
+        ]);
+        assert!(o.status.success());
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            !stderr.contains("PARANOID CHECK:") && !stdout.contains("PARANOID CHECK:"),
+            "preserved address reported as a leak for {line:?}: {stderr}{stdout}"
+        );
+    }
+}
+
+/// `--exclude domain` has to hold through the FQDN channel too. A 3+-segment email
+/// domain lands in both sets, and under `--aggressive` the FQDN pass rewrote the
+/// standalone occurrence while the address kept it — one string, two outcomes.
+#[test]
+fn exclude_domain_holds_through_the_fqdn_channel() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(
+        src.path().join("a.log"),
+        "a admin@mail.acme-corp.com b mail.acme-corp.com standalone\n",
+    )
+    .unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "-e",
+        "domain",
+    ]);
+    assert!(o.status.success());
+    let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+    assert!(
+        got.contains("b mail.acme-corp.com standalone"),
+        "the standalone occurrence must be preserved like the one in the address: {got}"
+    );
+}
+
+/// A `.zip` entry inside a `.zip` input used to be bucketed with unhandled
+/// extensions, whose report ends with "add text types with --ext". Following that
+/// advice decodes and rewrites a binary file: the nested archive comes out corrupt
+/// ("Bad magic number for central directory") rather than anonymized.
+#[test]
+fn nested_archive_in_zip_input_is_not_advised_as_an_extension() {
+    let dir = TempDir::new().unwrap();
+    let inner = dir.path().join("Inner.zip");
+    make_zip(&inner, &[("Deep.log", "deep carol@corp.com\n")]);
+    let inner_bytes = fs::read(&inner).unwrap();
+
+    let bundle = dir.path().join("bundle.zip");
+    {
+        use std::io::Write;
+        let f = fs::File::create(&bundle).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file("ok.log", opts).unwrap();
+        zw.write_all(b"ok admin@corp.com\n").unwrap();
+        zw.start_file("Inner.zip", opts).unwrap();
+        zw.write_all(&inner_bytes).unwrap();
+        zw.finish().unwrap();
+    }
+
+    let out_zip = dir.path().join("anon.zip");
+    let o = run(&[
+        "-d",
+        bundle.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(o.status.success());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("found inside another archive") && stderr.contains("bundle.zip::Inner.zip"),
+        "the nested archive must get the not-covered message. stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("1 .zip"),
+        "it must not be listed as an unhandled extension. stderr: {stderr}"
+    );
+}
+
+/// `zip` is not a text extension. Accepting it decodes the archive, rewrites bytes
+/// that happen to match an entity and re-encodes — producing a corrupt archive —
+/// and also shadows archive handling, so `--expand-archives` never expands.
+#[test]
+fn zip_is_refused_as_a_text_extension() {
+    let dir = TempDir::new().unwrap();
+    let inner = dir.path().join("Inner.zip");
+    make_zip(&inner, &[("Deep.log", "deep carol@corp.com\n")]);
+    let inner_bytes = fs::read(&inner).unwrap();
+
+    let bundle = dir.path().join("bundle.zip");
+    {
+        use std::io::Write;
+        let f = fs::File::create(&bundle).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file("Inner.zip", opts).unwrap();
+        zw.write_all(&inner_bytes).unwrap();
+        zw.finish().unwrap();
+    }
+
+    let out_zip = dir.path().join("anon.zip");
+    let o = run(&[
+        "-d",
+        bundle.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--ext",
+        "zip",
+    ]);
+    assert!(o.status.success());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(
+        stderr.matches("Ignoring `zip`").count(),
+        1,
+        "warned exactly once. stderr: {stderr}"
+    );
+
+    // The nested archive must come out byte-identical, still a readable zip.
+    let out = fs::File::open(&out_zip).unwrap();
+    let mut archive = zip::ZipArchive::new(out).unwrap();
+    let mut got = Vec::new();
+    {
+        use std::io::Read;
+        archive
+            .by_name("Inner.zip")
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+    }
+    assert_eq!(got, inner_bytes, "the nested archive was corrupted");
+}
+
+/// The same refusal must not disable expansion: with `--ext zip` the archive is
+/// still an archive, so `--expand-archives` covers its entries.
+#[test]
+fn ext_zip_does_not_disable_expansion() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    make_zip(
+        &src.path().join("rot.zip"),
+        &[("r.log", "r bob@corp.com 10.4.4.4\n")],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--expand-archives",
+        "--ext",
+        "zip",
+    ]);
+    assert!(o.status.success());
+    let names = rel_paths(out.path());
+    assert!(
+        names.iter().any(|n| n.contains("rot.zip.extracted")),
+        "the archive must still be expanded: {names:?}"
+    );
+    for p in collect_files(out.path()) {
+        let c = fs::read_to_string(&p).unwrap_or_default();
+        assert!(
+            !c.contains("bob@corp.com"),
+            "{} not anonymized",
+            p.display()
+        );
+    }
+}
+
+/// Backing off from a MAC claim on *any* adjacent colon hands the match to nobody
+/// whenever the IPv6 channel would not take it either: RE_IPV6 never matches the
+/// hyphen form, and an all-digit six-group run is rejected as IPv6. Those MACs then
+/// shipped in clear with no flags at all — and --paranoid could not see it, since
+/// an entity in no map is in no scan list. Only a `::` prefix means "IPv6 tail".
+#[test]
+fn colon_adjacent_macs_are_still_anonymized() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    // The `::`-prefixed rows are the ones a prefix-only guard drops: the hyphen
+    // form is never IPv6, and an all-digit six-group run is rejected as IPv6, so
+    // backing off on the prefix alone leaves them claimed by nobody. The
+    // C++-scope shapes are ordinary machine-generated trace output.
+    let raw = concat!(
+        "Adapter:00-50-56-96-AA-78 state up\n",
+        "MAC:00-50-56-96-AA-01 here\n",
+        "00-50-56-96-AA-02: link up\n",
+        "label:00:11:22:33:44:07 end\n",
+        "00:11:22:33:44:08: trailing\n",
+        "hexctx mac:00:50:56:96:AA:7E end\n",
+        "bare ::00:11:22:33:44:55 end\n",
+        "bare ::00-50-56-96-AA-61 end\n",
+        "pfx fd00::00:11:22:33:44:63 end\n",
+        "pfx fd00::00-50-56-96-AA-64 end\n",
+        "cpp Veeam::Backup::00-50-56-96-AA-66 end\n",
+        "cpp Veeam::Net::00:11:22:33:44:67 end\n",
+        "cls CNetAdapter::00-50-56-96-AA-78 end\n",
+        "v6 fd00::aa:bb:cc:dd:ee:ff end\n",
+    );
+    fs::write(src.path().join("a.log"), raw).unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+    ]);
+    assert!(o.status.success());
+    let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+    for leaked in [
+        "00-50-56-96-AA-78",
+        "00-50-56-96-AA-01",
+        "00-50-56-96-AA-02",
+        "00:11:22:33:44:07",
+        "00:11:22:33:44:08",
+        "00:50:56:96:AA:7E",
+        "00:11:22:33:44:55",
+        "00-50-56-96-AA-61",
+        "00:11:22:33:44:63",
+        "00-50-56-96-AA-64",
+        "00-50-56-96-AA-66",
+        "00:11:22:33:44:67",
+    ] {
+        assert!(
+            !got.contains(leaked),
+            "{leaked} shipped in clear with no flags: {got}"
+        );
+    }
+    assert!(
+        !got.contains("fd00::aa:bb:cc:dd:ee:ff"),
+        "the compressed IPv6 must still be masked: {got}"
+    );
+}
+
+/// And `--exclude mac` must preserve all of those shapes — including the
+/// colon-adjacent hex-letter MAC, which is what #13 was filed about.
+#[test]
+fn exclude_mac_preserves_colon_adjacent_shapes() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let raw = concat!(
+        "Adapter:00-50-56-96-AA-78 up\n",
+        "label:00:11:22:33:44:07 end\n",
+        "hexctx mac:00:50:56:96:AA:7E end\n",
+        "v6 fd00::aa:bb:cc:dd:ee:ff end\n",
+    );
+    fs::write(src.path().join("a.log"), raw).unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "-e",
+        "mac",
+    ]);
+    assert!(o.status.success());
+    let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+    for kept in [
+        "00-50-56-96-AA-78",
+        "00:11:22:33:44:07",
+        "00:50:56:96:AA:7E",
+    ] {
+        assert!(got.contains(kept), "-e mac must preserve {kept}: {got}");
+    }
+    assert!(
+        !got.contains("fd00::aa:bb:cc:dd:ee:ff"),
+        "but the IPv6 must still be masked: {got}"
+    );
 }

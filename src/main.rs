@@ -243,6 +243,14 @@ static RE_JWT: LazyLock<Regex> = LazyLock::new(|| {
 /// Matches 8 hextets, OR uses `::` compression, with at least 3 colons total.
 /// Trailing `%iface` zone identifier is captured as part of the match for
 /// proper anonymization but not required.
+///
+/// This is deliberately loose (it also matches a bare 6-group colon MAC,
+/// since a MAC is just six groups of 2 hex digits and this pattern allows
+/// 2-7 groups of 1-4). That ambiguity is resolved at extraction time, not
+/// here: `extract_entities_of_kind` runs `RE_MAC_COLON` first and skips any
+/// IPv6 candidate already claimed as a MAC (see #13) — a real IPv6 address
+/// either compresses with `::` or has all 8 hextets, so an unambiguous
+/// 6-group MAC shape can never be a genuine IPv6 match.
 static RE_IPV6: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:[0-9a-f]{1,4}:){2,7}(?:[0-9a-f]{1,4}|:)(?:%[a-zA-Z0-9_-]+)?\b").unwrap()
 });
@@ -251,6 +259,9 @@ static RE_IPV6: LazyLock<Regex> = LazyLock::new(|| {
 ///   - Canonical: `XX:XX:XX:XX:XX:XX` (colon) or `XX-XX-XX-XX-XX-XX` (hyphen)
 ///   - Compact: `XXXXXXXXXXXX` (12 hex chars, no separator) — only when
 ///     inside a recognized field like "Physical Address."
+///
+/// The colon form is checked ahead of `RE_IPV6` for exactly this reason —
+/// see the note on `RE_IPV6` and issue #13.
 static RE_MAC_COLON: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}\b").unwrap());
 
@@ -547,6 +558,19 @@ struct AnonymizationMap {
     objects: HashMap<String, String>,
     /// Database names (from --db-list).
     dbs: HashMap<String, String>,
+    /// Emails skipped by `--exclude email`. Not a `String -> String` entry —
+    /// there is no replacement, the address must come back out unchanged — so
+    /// it lives in its own set rather than `emails`, and is deliberately left
+    /// out of `total_entities()`, the dictionary export, and the "Found:"
+    /// summary: it was skipped, not anonymized, and counting it there would
+    /// recreate the exact contradiction #14 was filed over.
+    ///
+    /// It still has to be threaded through to `apply_pairs_protected`,
+    /// though: the domain half of one of these addresses is still a domain,
+    /// and gets its own replacement the moment `domain` isn't *also*
+    /// excluded. Without this, that unrelated pass reaches into the address
+    /// and rewrites just its second half — see `apply_pairs_protected`.
+    protected_emails: HashSet<String>,
 }
 
 impl AnonymizationMap {
@@ -565,6 +589,7 @@ impl AnonymizationMap {
             hostnames: HashMap::new(),
             objects: HashMap::new(),
             dbs: HashMap::new(),
+            protected_emails: HashSet::new(),
         }
     }
 
@@ -743,7 +768,8 @@ struct Cli {
     stats: bool,
 
     /// Exclude entity types from anonymization (comma-separated).
-    /// Valid types: email, user, domain, ip, naked-user, fqdn, pem, private-key, jwt
+    /// Valid types: email, user, domain, ip, ipv6, mac, ssh-fp, backup-file,
+    /// naked-user, fqdn, hostname, object, db, pem, private-key, jwt
     #[arg(
         short = 'e',
         long = "exclude",
@@ -838,25 +864,44 @@ impl Cli {
     /// anonymized nor copied, so the run reported success on a partial result.
     fn text_extensions(&self) -> BTreeSet<String> {
         let normalize = |s: &String| s.trim().trim_start_matches('.').to_ascii_lowercase();
-        if !self.only_extensions.is_empty() {
-            return self
-                .only_extensions
+        let mut set: BTreeSet<String> = if !self.only_extensions.is_empty() {
+            self.only_extensions
                 .iter()
                 .map(normalize)
                 .filter(|s| !s.is_empty())
-                .collect();
-        }
-        let mut set: BTreeSet<String> = DEFAULT_TEXT_EXTENSIONS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        set.extend(
-            self.extra_extensions
+                .collect()
+        } else {
+            let mut set: BTreeSet<String> = DEFAULT_TEXT_EXTENSIONS
                 .iter()
-                .map(normalize)
-                .filter(|s| !s.is_empty()),
-        );
+                .map(|s| s.to_string())
+                .collect();
+            set.extend(
+                self.extra_extensions
+                    .iter()
+                    .map(normalize)
+                    .filter(|s| !s.is_empty()),
+            );
+            set
+        };
+        // `zip` can never be a *text* extension. Treating an archive as text decodes
+        // it, rewrites bytes that happen to match an entity, and re-encodes — the
+        // result is a corrupt archive ("Bad magic number for central directory"),
+        // not an anonymized one. It also shadows the archive handling itself: a
+        // `.zip` claimed as text is hard-linked into staging instead of being
+        // expanded, so `--expand-archives` reports "Expanded 0 archive(s)" and the
+        // contents are neither covered nor mentioned.
+        set.remove("zip");
         set
+    }
+
+    /// True when the caller asked for `zip` and it was dropped, so `run` can say so
+    /// once rather than every time the set is rebuilt.
+    fn asked_for_zip_extension(&self) -> bool {
+        let normalize = |s: &String| s.trim().trim_start_matches('.').to_ascii_lowercase();
+        self.only_extensions
+            .iter()
+            .chain(self.extra_extensions.iter())
+            .any(|e| normalize(e) == "zip")
     }
 
     /// The active extension set, formatted for messages.
@@ -1639,6 +1684,77 @@ fn extract_entities_of_kind(
 
     // ─── v2.4 detections ───────────────────────────────────────────
 
+    // MAC addresses (colon/hyphen format) — deliberately extracted BEFORE
+    // IPv6. A colon-separated MAC (`00:50:56:96:AA:77`) is six groups of
+    // exactly two hex digits, which is also a syntactically valid match for
+    // the loose IPv6 pattern below (2-7 groups, no strict hextet-count
+    // check). `00:50:56:...` is the VMware OUI, so a MAC with a hex letter
+    // in it is the common case in a Veeam bundle, not the exotic one — if
+    // the IPv6 channel claims it first, `--exclude mac` silently fails to
+    // preserve most real MACs (#13), and the address is masked with the
+    // IPv6 format instead of the documented MAC one. Populating
+    // `out.macs_colon` first lets the IPv6 loop below check it and back off.
+    // Byte ranges the MAC channel actually took. The hand-off to IPv6 has to be
+    // decided per *occurrence*, not per string: the same literal can be an IPv6
+    // tail in one place and a bare MAC in another —
+    //
+    //   route fd00::aa:bb:cc:dd:ee:ff via gw
+    //   nic hwaddr aa:bb:cc:dd:ee:ff
+    //
+    // — and a set-membership check makes the second occurrence's MAC claim suppress
+    // the IPv6 channel for the first, so `--exclude mac` left both in clear.
+    let mut mac_spans: Vec<(usize, usize)> = Vec::new();
+
+    for m in RE_MAC_COLON.find_iter(content) {
+        let matched = m.as_str();
+        // Stand aside only when the IPv6 channel will demonstrably take this match.
+        // All three conditions are load-bearing:
+        //
+        //  - it must be colon-separated, because `RE_IPV6` never matches the hyphen
+        //    form, whatever precedes it;
+        //  - it must be preceded by `::`, the one reason `RE_IPV6` captures a tail
+        //    rather than a whole address (it cannot start a match at a hextet
+        //    followed by `::`), so `fd00::aa:bb:cc:dd:ee:ff` needs the hand-off;
+        //  - `should_anonymize_ipv6` must accept it, since that is the gate the IPv6
+        //    loop applies — it rejects an all-digit six-group run, so
+        //    `fd00::00:11:22:33:44:55` would otherwise be claimed by nobody.
+        //
+        // Testing the prefix alone, or any adjacent colon, drops MACs that nothing
+        // else picks up: `Adapter:00-50-56-96-AA-78`, `::00-50-56-96-AA-61` and the
+        // C++-scope shape `Veeam::Backup::00-50-56-96-AA-66` — ordinary
+        // machine-generated trace output — then ship in clear with no flags at all,
+        // and `--paranoid` cannot see it because an entity in no map is in no scan
+        // list. Two earlier attempts here each traded one leak for another by
+        // assuming the hand-off instead of confirming it.
+        // Two conditions, and the second asks the IPv6 pattern directly rather than
+        // approximating it.
+        //
+        // The `::` prefix is what makes this a fragment: `RE_IPV6` needs two groups
+        // before a `::`, so it cannot start a match at `fd00` in
+        // `fd00::aa:bb:cc:dd:ee:ff` and captures only the tail — which is why the
+        // hand-off is needed there and not for a bare `00:50:56:96:AA:77`, where the
+        // MAC channel is the right owner and #13 requires it.
+        //
+        // Then: does `RE_IPV6` actually match here, and does the gate the IPv6 loop
+        // applies accept it? Proxy tests for that kept letting shapes slip. The last
+        // one — "colon-separated" — missed mixed separators, because `RE_MAC_COLON`
+        // alternates `[:-]` *per separator*: `fd00::aa-bb:cc-dd:ee-ff` contains a
+        // colon, sits after `::`, and passes the heuristic, but `RE_IPV6` cannot
+        // cross a `-`, so nothing claimed it. Asking the pattern is correct by
+        // construction; asking something that resembles it is a guess, and three
+        // guesses in a row each traded one leak for another.
+        let ipv6_will_take_it = content[..m.start()].ends_with("::")
+            && RE_IPV6
+                .find_at(content, m.start())
+                .filter(|v6| v6.start() <= m.start() && v6.end() >= m.end())
+                .is_some_and(|v6| should_anonymize_ipv6(v6.as_str()));
+        if ipv6_will_take_it {
+            continue;
+        }
+        mac_spans.push((m.start(), m.end()));
+        out.macs_colon.insert(matched.to_string());
+    }
+
     // IPv6 addresses
     for m in RE_IPV6.find_iter(content) {
         let s = m.as_str();
@@ -1648,14 +1764,15 @@ fn extract_entities_of_kind(
         if !s.contains(':') {
             continue;
         }
+        // This exact occurrence was taken by the MAC channel above, so it is
+        // anonymized once, with the documented MAC mask, and `--exclude mac`
+        // preserves it. `find_iter` yields in order, so the spans are sorted.
+        if mac_spans.binary_search(&(m.start(), m.end())).is_ok() {
+            continue;
+        }
         if should_anonymize_ipv6(s) {
             out.ipv6s.insert(s.to_string());
         }
-    }
-
-    // MAC addresses (colon/hyphen format)
-    for m in RE_MAC_COLON.find_iter(content) {
-        out.macs_colon.insert(m.as_str().to_string());
     }
 
     // MAC addresses (compact 12-hex, contextual)
@@ -1837,12 +1954,19 @@ fn build_map(
     extract_cfg: &ExtractConfig,
 ) -> AnonymizationMap {
     // Apply exclusion filter
+    //
+    // `protected_emails` carries the addresses this branch skips through to
+    // the map unchanged (see the field's doc comment on `AnonymizationMap`):
+    // they get no `map.emails` entry, but still need shielding from the
+    // domain pass below when `domain` isn't excluded too.
+    let mut protected_emails: HashSet<String> = HashSet::new();
     let emails = if exclude.process_emails() {
         raw.emails
     } else {
         if !raw.emails.is_empty() {
             eprintln!("  Skipped {} email(s) (excluded)", raw.emails.len());
         }
+        protected_emails = raw.emails;
         HashSet::new()
     };
 
@@ -1858,12 +1982,18 @@ fn build_map(
         HashSet::new()
     };
 
+    // Kept when domains are excluded so the FQDN channel below can honour the
+    // exclusion too: a 3+-segment email domain lands in both sets, and letting the
+    // FQDN pass rewrite it gives the same string two different outcomes in one run
+    // — preserved inside the address, anonymized standing alone.
+    let mut excluded_domains: HashSet<String> = HashSet::new();
     let domains = if exclude.process_domains() {
         raw.domains
     } else {
         if !raw.domains.is_empty() {
             eprintln!("  Skipped {} domain(s) (excluded)", raw.domains.len());
         }
+        excluded_domains = raw.domains;
         HashSet::new()
     };
 
@@ -1889,7 +2019,12 @@ fn build_map(
     };
 
     let fqdns = if exclude.process_fqdns() {
+        // An FQDN that is also an excluded domain has to stay excluded — see
+        // `excluded_domains`.
         raw.fqdns
+            .into_iter()
+            .filter(|f| !excluded_domains.contains(f))
+            .collect()
     } else {
         if !raw.fqdns.is_empty() {
             eprintln!("  Skipped {} FQDN(s) (excluded)", raw.fqdns.len());
@@ -1943,6 +2078,7 @@ fn build_map(
 
     // Build the anonymization map with domain consistency + collision detection
     let mut map = AnonymizationMap::new();
+    map.protected_emails = protected_emails;
     let mut used_domain_repls: HashSet<String> = HashSet::new();
     let mut used_email_locals: HashSet<String> = HashSet::new();
     let mut used_user_pairs: HashSet<String> = HashSet::new();
@@ -1974,17 +2110,29 @@ fn build_map(
     }
 
     // STEP 2: Generate email replacements USING existing domain mappings
+    //
+    // `domain_part` is always a member of `domains` when domains aren't
+    // excluded: `extract_entities_of_kind` adds an email's domain to
+    // `out.domains` in the very same breath as the email itself, so STEP 1 —
+    // which ran over all of `domains` before this loop started — has already
+    // inserted it. The lookup below can only miss when `--exclude domain`
+    // emptied `domains` before STEP 1 ran.
+    //
+    // The `None` arm used to paper over that by minting a brand-new random
+    // mapping and, critically, registering it in `map.domains` — which is
+    // read by every OTHER occurrence of that domain in the corpus too. So
+    // `--exclude domain` looked honoured right here (this email still got
+    // anonymized) while silently un-excluding the domain everywhere else it
+    // appeared, including standing alone (#14). Once excluded, a domain must
+    // stay out of `map.domains` for good, so the fallback now keeps the
+    // domain half of the address exactly as found instead of fabricating a
+    // mapping for it.
     for email in &emails {
         if let Some(at_pos) = email.find('@') {
             let domain_part = &email[at_pos + 1..];
-            let domain_replacement = if let Some(existing) = map.domains.get(domain_part) {
-                existing.clone()
-            } else {
-                let body = unique_random(&mut used_domain_repls, 12);
-                let new_domain = format!("{}.com", body);
-                map.domains
-                    .insert(domain_part.to_string(), new_domain.clone());
-                new_domain
+            let domain_replacement = match map.domains.get(domain_part) {
+                Some(existing) => existing.clone(),
+                None => domain_part.to_string(),
             };
             let local = unique_random(&mut used_email_locals, 8);
             let replacement = format!("{}@{}", local, domain_replacement);
@@ -2256,7 +2404,8 @@ fn apply_replacements(content: &str, map: &AnonymizationMap, exclude: &ExcludeFi
 
     // Step 5: literal replacements via Aho-Corasick
     let pairs = collect_replacement_pairs(map);
-    apply_pairs(&work, &pairs)
+    let protect = collect_protected_literals(map);
+    apply_pairs_protected(&work, &pairs, &protect)
 }
 
 /// Collect all (original, replacement) pairs from the map, sorted longest-first
@@ -2307,6 +2456,14 @@ fn collect_replacement_pairs(map: &AnonymizationMap) -> Vec<(String, String)> {
     pairs
 }
 
+/// Literal strings that must survive `apply_pairs_protected` byte-for-byte —
+/// currently just addresses skipped by `--exclude email`. See
+/// `apply_pairs_protected` for why the flat substring pass needs this list at
+/// all, rather than just leaving those addresses out of `pairs`.
+fn collect_protected_literals(map: &AnonymizationMap) -> Vec<String> {
+    map.protected_emails.iter().cloned().collect()
+}
+
 /// Collect (original, filesystem-safe replacement) pairs for anonymizing file
 /// and directory names. Covers every entity kind in the literal map; IPv4/IPv6/
 /// MAC masks (which contain `*`/`:`) and DOMAIN\user (`\`) are rendered through
@@ -2344,12 +2501,41 @@ fn to_path_safe(s: &str) -> String {
 /// Apply literal replacements using Aho-Corasick (case-insensitive, leftmost-longest).
 /// This is the single-pass engine; replacement values are never re-matched.
 fn apply_pairs(content: &str, pairs: &[(String, String)]) -> String {
-    if pairs.is_empty() {
+    apply_pairs_protected(content, pairs, &[])
+}
+
+/// Same engine as `apply_pairs`, plus a `protect` list of literal strings that
+/// must come back out byte-for-byte, even though a *shorter* pattern in
+/// `pairs` might otherwise match a piece of them.
+///
+/// This exists for `--exclude email`: the domain half of a skipped address is
+/// still a domain, and gets its own, unrelated replacement pattern the moment
+/// `domain` isn't excluded too. A flat substring pass can't tell "the domain
+/// standing alone" from "the same six characters, found starting one position
+/// after the `@` in an address we were told to leave alone" — both are just
+/// the substring `acme-corp.com`. Aho-Corasick's LeftmostLongest already
+/// breaks exactly that kind of tie by preferring the longest match at the
+/// earliest position, so registering the *whole* protected address as its own
+/// (longer, earlier-starting) pattern makes it win that race and consumes the
+/// nested domain match before it ever fires. The `None` replacement below
+/// means "copy the source through unchanged" rather than "substitute nothing"
+/// — that is what keeps the address's original case intact instead of forcing
+/// it to whatever case the pattern happened to be recorded in.
+fn apply_pairs_protected(content: &str, pairs: &[(String, String)], protect: &[String]) -> String {
+    if pairs.is_empty() && protect.is_empty() {
         return content.to_string();
     }
 
-    let patterns: Vec<&str> = pairs.iter().map(|(o, _)| o.as_str()).collect();
-    let replacements: Vec<&str> = pairs.iter().map(|(_, r)| r.as_str()).collect();
+    let mut patterns: Vec<&str> = Vec::with_capacity(pairs.len() + protect.len());
+    let mut replacements: Vec<Option<&str>> = Vec::with_capacity(pairs.len() + protect.len());
+    for (orig, anon) in pairs {
+        patterns.push(orig.as_str());
+        replacements.push(Some(anon.as_str()));
+    }
+    for literal in protect {
+        patterns.push(literal.as_str());
+        replacements.push(None);
+    }
 
     let ac = match AhoCorasickBuilder::new()
         .ascii_case_insensitive(true)
@@ -2364,12 +2550,17 @@ fn apply_pairs(content: &str, pairs: &[(String, String)]) -> String {
 }
 
 /// Helper: stream replacements through Aho-Corasick into a fresh string.
-fn ac_replace_all(ac: &AhoCorasick, haystack: &str, replacements: &[&str]) -> String {
+/// A `None` entry means "protected" — the matched span is copied through
+/// unchanged instead of substituted, preserving the source's exact case.
+fn ac_replace_all(ac: &AhoCorasick, haystack: &str, replacements: &[Option<&str>]) -> String {
     let mut out = String::with_capacity(haystack.len());
     let mut last_end = 0usize;
     for mat in ac.find_iter(haystack) {
         out.push_str(&haystack[last_end..mat.start()]);
-        out.push_str(replacements[mat.pattern().as_usize()]);
+        match replacements[mat.pattern().as_usize()] {
+            Some(r) => out.push_str(r),
+            None => out.push_str(&haystack[mat.start()..mat.end()]),
+        }
         last_end = mat.end();
     }
     out.push_str(&haystack[last_end..]);
@@ -2391,6 +2582,7 @@ fn process_files(
 
     // Path-safe replacement pairs for anonymizing file/directory names.
     let path_pairs = collect_path_replacement_pairs(map);
+    let path_protect = collect_protected_literals(map);
 
     input_files
         .par_iter()
@@ -2398,7 +2590,8 @@ fn process_files(
         .try_for_each(|input_file| -> Result<()> {
             // Compute output path (preserving subdirectory structure, with
             // sensitive entities in path names anonymized unless --keep-path-names)
-            let output_file = compute_output_path(input_file, output_dir, cli, &path_pairs);
+            let output_file =
+                compute_output_path(input_file, output_dir, cli, &path_pairs, &path_protect);
 
             // Create parent directories if needed
             if let Some(parent) = output_file.parent() {
@@ -2462,14 +2655,21 @@ fn relative_path_str(input_file: &Path, base_dir: Option<&Path>) -> String {
 /// pairs, then rebuild the path. Directory and file names are both processed.
 /// The `.log` extension and recognizable prefixes (Task./Agent./Svc.) survive
 /// because they are not entities. Returns the relative anonymized PathBuf.
-fn anonymize_relative_path(relative: &Path, path_pairs: &[(String, String)]) -> PathBuf {
-    if path_pairs.is_empty() {
+fn anonymize_relative_path(
+    relative: &Path,
+    path_pairs: &[(String, String)],
+    protect: &[String],
+) -> PathBuf {
+    if path_pairs.is_empty() && protect.is_empty() {
         return relative.to_path_buf();
     }
     let mut out = PathBuf::new();
     for component in relative.components() {
         let part = component.as_os_str().to_string_lossy();
-        let anon = apply_pairs(&part, path_pairs);
+        // An address the operator excluded has to survive here too. Preserving it
+        // in content while the file *name* keeps a rewritten domain half is the
+        // same half-anonymized result `--exclude email` exists to avoid.
+        let anon = apply_pairs_protected(&part, path_pairs, protect);
         out.push(anon);
     }
     out
@@ -2482,6 +2682,7 @@ fn compute_output_path(
     output_dir: &Path,
     cli: &Cli,
     path_pairs: &[(String, String)],
+    protect: &[String],
 ) -> PathBuf {
     // Relative path under the output directory (file name in single-file mode).
     let relative: PathBuf = if let Some(ref input_dir) = cli.input_directory {
@@ -2497,7 +2698,7 @@ fn compute_output_path(
     let relative = if cli.keep_path_names {
         relative
     } else {
-        anonymize_relative_path(&relative, path_pairs)
+        anonymize_relative_path(&relative, path_pairs, protect)
     };
 
     output_dir.join(relative)
@@ -2522,6 +2723,19 @@ struct StageStats {
     entries: usize,
     linked: usize,
     copied: usize,
+    /// Files left outside the active extension set, tallied by extension —
+    /// whether found directly in the directory or as an entry inside an archive
+    /// being expanded. Both end up in the same place: neither anonymized nor
+    /// written to the output. Kept together (rather than as two maps) so the
+    /// caller reports them with the same call it already had for the
+    /// non-expanding path, and the operator sees one number, not two that need
+    /// adding up by hand.
+    skipped: BTreeMap<String, usize>,
+    /// Archives found nested inside another archive being expanded, recorded as
+    /// `"<outer path>::<entry name>"`. `--expand-archives` does not recurse into
+    /// these — see `report_nested_archives` for why — so they are named instead
+    /// of silently vanishing the way they did before this field existed.
+    nested_archives: Vec<String>,
 }
 
 /// Strip a zip entry name down to safe relative components.
@@ -2643,6 +2857,14 @@ fn create_new_file(dest: &Path) -> Result<fs::File> {
 /// `<archive name>.extracted/<entry>` beside the archive. Nothing in the input is
 /// modified: the staged tree is read-only as far as this program is concerned, and
 /// hard links share an inode with the original.
+///
+/// Everything this walk decides *not* to stage — an out-of-set file, an out-of-set
+/// archive entry, an archive nested inside another archive — is tallied into the
+/// returned `StageStats` rather than dropped on the floor. The staging root only
+/// ever contains what belongs in the active extension set, so the ordinary
+/// `collect_input_files` walk that runs next, over that root, will find nothing left
+/// to report; this is the only place that still has the full picture, and the
+/// caller reports these tallies before the staged run starts (#15).
 fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
     let root = create_staging_root()?;
     let staging = StagingDir(root.clone());
@@ -2730,6 +2952,33 @@ fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
                 }
                 let name = member.name().to_string();
                 if !entry_is_text(&name) {
+                    let entry_ext = Path::new(&name)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if entry_ext == "zip" {
+                        // A `.zip` inside the `.zip` being expanded. Recursing would
+                        // need random access into an entry that only offers a
+                        // forward-only decompression stream — the only way to get
+                        // that is to fully materialize the nested archive first, in
+                        // memory or to a scratch file, which reopens exactly the
+                        // amplification the streaming copy below is careful to
+                        // avoid: two independent compression layers instead of one is
+                        // the shape a zip bomb exploits, however small the extra
+                        // depth looks. Name it and report it instead (see
+                        // `report_nested_archives`) — VB365 bundles do nest this way,
+                        // and the operator needs to know the content was never
+                        // covered, not merely that it was "skipped".
+                        stats
+                            .nested_archives
+                            .push(format!("{}::{}", rel.display(), name));
+                    } else {
+                        *stats
+                            .skipped
+                            .entry(extension_label(&entry_ext))
+                            .or_insert(0) += 1;
+                    }
                     continue;
                 }
                 // Same sanitising and collision handling the two output writers use.
@@ -2753,6 +3002,16 @@ fn stage_with_archives(dir: &Path) -> Result<(StagingDir, StageStats)> {
                     }
                 }
             }
+        } else {
+            // Neither staged nor an archive to expand — this is the gap #15 was
+            // filed over. `collect_input_files` runs next, but only over the
+            // staging root it just walked into being, where nothing outside the
+            // active set was ever placed; it would have nothing left to report,
+            // and the flag that exists to widen coverage would be the reason
+            // coverage looked complete when a `.reg` (or anything else out of
+            // set) was quietly missing from the output. Tally it here instead,
+            // where the file is still in view.
+            *stats.skipped.entry(extension_label(&ext)).or_insert(0) += 1;
         }
     }
 
@@ -2772,6 +3031,23 @@ enum UnhandledFate {
     /// dangerous one — an untouched text entry ships real customer data inside the
     /// file that gets sent to support — so it has to be said out loud.
     CopiedVerbatim,
+}
+
+/// Label a lowercased extension for a coverage report: `.ext`, or `(none)` for
+/// an extensionless name.
+///
+/// One function so every unhandled-extension tally — the directory walk, a
+/// `.zip` input's entries, and now the entries `--expand-archives` walks while
+/// staging — groups identically. Two call sites spelling this differently used
+/// to be exactly how a `.reg` file could show up as `.reg` in one report and
+/// `reg` or `(none)` in another, which looks like two different problems
+/// instead of the same file counted twice.
+fn extension_label(ext: &str) -> String {
+    if ext.is_empty() {
+        "(none)".to_string()
+    } else {
+        format!(".{ext}")
+    }
 }
 
 /// Report files/entries left outside the active extension set, grouped by extension.
@@ -2808,15 +3084,53 @@ fn report_unhandled_extensions(skipped: &BTreeMap<String, usize>, fate: Unhandle
     }
 }
 
+/// Report archives found nested inside another archive `--expand-archives` is
+/// expanding.
+///
+/// `--expand-archives` recurses exactly one level: the archives it finds
+/// directly inside the input directory. An archive found *inside one of those*
+/// is not expanded in turn (see the comment at the nested-`.zip` branch in
+/// `stage_with_archives` for why recursing would be more expensive than it
+/// looks), so it is named here instead. Deliberately not folded into
+/// `report_unhandled_extensions`: that function's wording is about an
+/// extension the operator can widen coverage for with `--ext`; there is no
+/// flag that reaches inside a second archive layer, so the message says so
+/// plainly rather than implying one more flag would fix it.
+fn report_nested_archives(nested: &[String], copied_through: bool) {
+    if nested.is_empty() {
+        return;
+    }
+    eprintln!(
+        "  ⚠ {} archive(s) found inside another archive — NOT covered:",
+        nested.len()
+    );
+    for name in nested {
+        eprintln!("      {name}");
+    }
+    eprintln!("    An archive nested one layer deeper is not opened: reading it needs random");
+    eprintln!("    access into a forward-only decompression stream, so it would have to be");
+    eprintln!("    materialised whole first — two stacked compression layers, the shape a zip");
+    eprintln!("    bomb exploits. Deliberately no flag reaches this far, which is why this is");
+    eprintln!("    worded as not covered rather than skipped.");
+    if copied_through {
+        eprintln!("    The archive itself is copied into the output byte-for-byte, so whatever it");
+        eprintln!("    holds is NOT anonymized. Extract it separately and re-run.");
+    } else {
+        eprintln!("    Its contents are neither anonymized nor written to the output in any form");
+        eprintln!("    — extract it separately and re-run if it needs covering.");
+    }
+}
+
 /// Tally the zip entries that fall outside the active extension set, by extension.
 ///
 /// Reads the central directory only — no entry is decompressed.
-fn tally_zip_unhandled(zip_path: &Path) -> Result<BTreeMap<String, usize>> {
+fn tally_zip_unhandled(zip_path: &Path) -> Result<(BTreeMap<String, usize>, Vec<String>)> {
     let file = fs::File::open(zip_path)
         .with_context(|| format!("Failed to open zip: {}", zip_path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("Failed to read zip: {}", zip_path.display()))?;
     let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+    let mut nested: Vec<String> = Vec::new();
     for i in 0..archive.len() {
         let Ok(entry) = archive.by_index(i) else {
             continue;
@@ -2828,17 +3142,26 @@ fn tally_zip_unhandled(zip_path: &Path) -> Result<BTreeMap<String, usize>> {
         if entry_is_text(&name) {
             continue;
         }
-        let label = match Path::new(&name)
+        let ext = Path::new(&name)
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
-        {
-            Some(ext) => format!(".{ext}"),
-            None => "(none)".to_string(),
-        };
-        *skipped.entry(label).or_insert(0) += 1;
+            .unwrap_or_default();
+        // An archive inside the bundle is not an "unhandled extension": the report
+        // for those ends with "add text types with --ext", and following that advice
+        // for a `.zip` decodes and rewrites a binary file, producing a corrupt
+        // archive rather than an anonymized one. It gets the nested-archive message,
+        // which says the content is not covered and offers no flag that would be.
+        if ext == "zip" {
+            nested.push(format!(
+                "{}::{name}",
+                zip_path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            continue;
+        }
+        *skipped.entry(extension_label(&ext)).or_insert(0) += 1;
     }
-    Ok(skipped)
+    Ok((skipped, nested))
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2876,12 +3199,7 @@ fn collect_input_files(cli: &Cli) -> Result<Vec<PathBuf>> {
             } else if ext == "zip" {
                 archives += 1;
             } else {
-                let label = if ext.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    format!(".{ext}")
-                };
-                *skipped.entry(label).or_insert(0) += 1;
+                *skipped.entry(extension_label(&ext)).or_insert(0) += 1;
             }
         }
 
@@ -3330,7 +3648,8 @@ fn reverse_anonymize(dict_path: &Path, input_files: &[PathBuf], cli: &Cli) -> Re
         .par_iter()
         .progress_with(anon_bar.clone())
         .try_for_each(|input_file| -> Result<()> {
-            let output_file = compute_output_path(input_file, output_dir, cli, &reverse_path_pairs);
+            let output_file =
+                compute_output_path(input_file, output_dir, cli, &reverse_path_pairs, &[]);
 
             if let Some(parent) = output_file.parent() {
                 if !parent.exists() && cli.force {
@@ -3417,10 +3736,44 @@ fn paranoid_rescan(input_files: &[PathBuf], map: &AnonymizationMap, cli: &Cli) -
 
     // Path-safe pairs are used to locate the (possibly renamed) output file.
     let path_pairs = collect_path_replacement_pairs(map);
+    let path_protect = collect_protected_literals(map);
     let output_dir = cli.require_output_dir()?;
 
+    // Spans the operator deliberately kept. An address preserved by
+    // `--exclude email` still contains its domain, and that domain is a live entry
+    // in `map.domains`, so a plain scan reports every protected address as a leak —
+    // the tool contradicting its own flag, one report further along than the bug
+    // `--exclude domain` was filed over. Blanking the protected spans before the
+    // scan keeps the automaton and its word-boundary rule untouched.
+    let protected = collect_protected_literals(map);
+    let blank_protected = |text: &str| -> String {
+        if protected.is_empty() {
+            return text.to_string();
+        }
+        // Case-insensitive, because the leak automaton is: addresses are stored
+        // lowercased, so a case-sensitive blank would miss `Admin@Acme-Corp.COM`
+        // and report it as a leak while the run had deliberately preserved it.
+        // `to_ascii_lowercase` is byte-length preserving, so offsets still line up.
+        let hay = text.to_ascii_lowercase();
+        let mut bytes = text.as_bytes().to_vec();
+        for literal in &protected {
+            let needle = literal.to_ascii_lowercase();
+            let mut from = 0;
+            while let Some(pos) = hay[from..].find(&needle) {
+                let start = from + pos;
+                for b in &mut bytes[start..start + needle.len()] {
+                    *b = b' ';
+                }
+                from = start + needle.len();
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+
     // Word-boundary leak scan helper, shared by content and path-name checks.
-    let scan_leaks = |text: &str, sink: &mut HashSet<usize>| {
+    let scan_leaks = |raw_text: &str, sink: &mut HashSet<usize>| {
+        let owned = blank_protected(raw_text);
+        let text: &str = &owned;
         let bytes = text.as_bytes();
         for mat in ac.find_iter(text) {
             // Require word-boundary on both sides to avoid matching
@@ -3440,7 +3793,8 @@ fn paranoid_rescan(input_files: &[PathBuf], map: &AnonymizationMap, cli: &Cli) -
     let total_leaks: usize = input_files
         .par_iter()
         .map(|input_file| -> usize {
-            let output_file = compute_output_path(input_file, output_dir, cli, &path_pairs);
+            let output_file =
+                compute_output_path(input_file, output_dir, cli, &path_pairs, &path_protect);
 
             // Check the output path NAME itself (file + directory components).
             // Catches sensitive tokens — e.g. short hostnames not provided via
@@ -3530,6 +3884,12 @@ fn run() -> Result<i32> {
     // Publish the extension set before any scanning: the zip entry gate reads it
     // through a global, and an unset global would silently fall back to defaults.
     let _ = TEXT_EXTENSIONS.set(cli.text_extensions());
+    if cli.asked_for_zip_extension() {
+        eprintln!("  ⚠ Ignoring `zip` in the extension set: an archive is not text, and");
+        eprintln!("    anonymizing it as text would corrupt it — the bytes that happen to match");
+        eprintln!("    an entity get rewritten and the archive stops being readable. Use");
+        eprintln!("    --expand-archives to cover the entries inside archives in a directory.");
+    }
 
     // Nested archives: stage the directory's text files and the archives' text
     // entries under one root, then point the pipeline at it. Held in scope so the
@@ -3558,6 +3918,15 @@ fn run() -> Result<i32> {
                         String::new()
                     }
                 );
+                // Report what staging itself left behind, right here, while it is
+                // still known. `collect_input_files` runs next over the staging
+                // root rather than the real input, and the root only ever holds
+                // what was in the active extension set to begin with — so its own
+                // report would always come back empty under this flag, which is
+                // the exact silence #15 was filed over: the flag that exists to
+                // improve coverage was what hid the remaining gap.
+                report_unhandled_extensions(&stats.skipped, UnhandledFate::Dropped);
+                report_nested_archives(&stats.nested_archives, false);
                 cli.input_directory = Some(staged.0.clone());
                 Some(staged)
             }
@@ -3962,8 +4331,9 @@ fn build_validate_report(
     // real output tree name-for-name. Never persisted; it lives only for this call.
     let map = build_map(union, exclude, cfg);
     let path_pairs = collect_path_replacement_pairs(&map);
+    let path_protect = collect_protected_literals(&map);
     let anon_path = |raw: &str| -> String {
-        anonymize_relative_path(Path::new(raw), &path_pairs)
+        anonymize_relative_path(Path::new(raw), &path_pairs, &path_protect)
             .to_string_lossy()
             .into_owned()
     };
@@ -4120,8 +4490,13 @@ fn entry_is_text(name: &str) -> bool {
 }
 
 /// Anonymize a zip entry path (forward-slash separated) component-by-component.
-fn anonymize_entry_name(name: &str, pairs: &[(String, String)], keep: bool) -> String {
-    if keep || pairs.is_empty() {
+fn anonymize_entry_name(
+    name: &str,
+    pairs: &[(String, String)],
+    keep: bool,
+    protect: &[String],
+) -> String {
+    if keep || (pairs.is_empty() && protect.is_empty()) {
         return name.to_string();
     }
     name.split('/')
@@ -4129,7 +4504,10 @@ fn anonymize_entry_name(name: &str, pairs: &[(String, String)], keep: bool) -> S
             if seg.is_empty() {
                 seg.to_string()
             } else {
-                apply_pairs(seg, pairs)
+                // Same reason as `anonymize_relative_path`: an excluded address kept
+                // in the content but rewritten in the entry name would be exactly the
+                // half-anonymized result `--exclude email` exists to avoid.
+                apply_pairs_protected(seg, pairs, protect)
             }
         })
         .collect::<Vec<_>>()
@@ -4186,10 +4564,9 @@ fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i3
 
     // Say what will be copied through untouched, before doing it — same reporting
     // the directory walk gives, so the two input modes agree on coverage.
-    report_unhandled_extensions(
-        &tally_zip_unhandled(&zip_path)?,
-        UnhandledFate::CopiedVerbatim,
-    );
+    let (zip_skipped, zip_nested) = tally_zip_unhandled(&zip_path)?;
+    report_unhandled_extensions(&zip_skipped, UnhandledFate::CopiedVerbatim);
+    report_nested_archives(&zip_nested, true);
 
     // Phase 1: scan
     let (raw, file_count) = scan_zip_entities(&zip_path, cfg)?;
@@ -4208,6 +4585,7 @@ fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i3
     }
 
     let path_pairs = collect_path_replacement_pairs(&map);
+    let path_protect = collect_protected_literals(&map);
 
     // Phase 2: write
     if let Some(out_zip) = &cli.output_zip {
@@ -4217,7 +4595,15 @@ fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i3
                 out_zip.display()
             );
         }
-        write_zip_output(&zip_path, out_zip, &map, exclude, &path_pairs, cli)?;
+        write_zip_output(
+            &zip_path,
+            out_zip,
+            &map,
+            exclude,
+            &path_pairs,
+            &path_protect,
+            cli,
+        )?;
         println!("\n  Output zip: {}", out_zip.display());
     } else {
         let out_dir = cli.require_output_dir()?;
@@ -4232,7 +4618,15 @@ fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i3
                 );
             }
         }
-        extract_zip_output(&zip_path, out_dir, &map, exclude, &path_pairs, cli)?;
+        extract_zip_output(
+            &zip_path,
+            out_dir,
+            &map,
+            exclude,
+            &path_pairs,
+            &path_protect,
+            cli,
+        )?;
         println!("\n  Output: {}", out_dir.display());
     }
 
@@ -4418,6 +4812,7 @@ fn write_zip_output(
     map: &AnonymizationMap,
     exclude: &ExcludeFilter,
     path_pairs: &[(String, String)],
+    protect: &[String],
     cli: &Cli,
 ) -> Result<()> {
     use std::io::{Read, Write};
@@ -4438,7 +4833,7 @@ fn write_zip_output(
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let name = entry.name().to_string();
-        let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names);
+        let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names, protect);
         // Repacking a traversal name unchanged would hand the attack downstream:
         // the archive going to support would itself write outside whatever
         // directory the recipient extracts it into.
@@ -4478,6 +4873,7 @@ fn extract_zip_output(
     map: &AnonymizationMap,
     exclude: &ExcludeFilter,
     path_pairs: &[(String, String)],
+    protect: &[String],
     cli: &Cli,
 ) -> Result<()> {
     use std::io::Read;
@@ -4492,7 +4888,7 @@ fn extract_zip_output(
             continue;
         }
         let name = entry.name().to_string();
-        let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names);
+        let anon_name = anonymize_entry_name(&name, path_pairs, cli.keep_path_names, protect);
         // `out_dir.join()` happily walks out of `out_dir` when the entry name says
         // so — `../../x` lands two levels above it, and an absolute or drive-letter
         // name replaces it outright.
@@ -4793,6 +5189,62 @@ mod tests {
         );
     }
 
+    /// The invariant the MAC/IPv6 hand-off rests on, asserted directly: every
+    /// `RE_MAC_COLON` match must end up claimed by exactly one channel. Two separate
+    /// leaks came from a guard that dropped a match from the MAC channel while
+    /// assuming the IPv6 channel would take it, and neither showed up in
+    /// shape-by-shape tests until someone happened to try that shape.
+    #[test]
+    fn every_mac_match_is_claimed_by_exactly_one_channel() {
+        let cfg = ExtractConfig {
+            aggressive: false,
+            user_list: HashSet::new(),
+            hostname_list: HashSet::new(),
+            object_list: HashSet::new(),
+            db_list: HashSet::new(),
+        };
+        let cases = [
+            "00:50:56:96:AA:77",
+            "00:11:22:33:44:55",
+            "00-50-56-96-AA-77",
+            "Adapter:00-50-56-96-AA-78",
+            "label:00:11:22:33:44:07",
+            "mac:00:50:56:96:AA:7E",
+            "::00:11:22:33:44:55",
+            "::00-50-56-96-AA-61",
+            "fd00::00:11:22:33:44:63",
+            "fd00::00-50-56-96-AA-64",
+            "Veeam::Backup::00-50-56-96-AA-66",
+            "Veeam::Net::00:11:22:33:44:67",
+            "CNetAdapter::00-50-56-96-AA-78",
+            "fd00::aa:bb:cc:dd:ee:ff",
+            "00:50:56:96:AA:02: trailing",
+            // Mixed separators: RE_MAC_COLON alternates `[:-]` per separator, so
+            // these are MAC matches that RE_IPV6 can never cross.
+            "fd00::aa-bb:cc-dd:ee-ff",
+            "Veeam::Backup::00-50-56-96-AA:77",
+            "00:50-56:96-AA:33",
+            "fd00::00:50-56:96-AA:34",
+            "::aa-bb:cc-dd:ee-ff",
+        ];
+        for text in cases {
+            let out = extract_entities_of_kind(text, &cfg, ContentKind::Plain);
+            for m in RE_MAC_COLON.find_iter(text) {
+                let matched = m.as_str();
+                let as_mac = out.macs_colon.contains(matched);
+                // The IPv6 channel may claim this occurrence under a longer span, so
+                // any recorded IPv6 that contains the match counts as covering it.
+                let as_ipv6 = out.ipv6s.iter().any(|v| v.contains(matched));
+                assert!(
+                    as_mac || as_ipv6,
+                    "{matched:?} in {text:?} was claimed by neither channel — it would \
+                     ship in clear, and --paranoid cannot see it because an entity in \
+                     no map is in no scan list"
+                );
+            }
+        }
+    }
+
     /// A genuine account in JSON-encoded text is written `DOMAIN\\user`, which the
     /// single-backslash pattern can never match — it used to go through in clear (#8).
     #[test]
@@ -5073,6 +5525,123 @@ mod tests {
         assert!(result.contains("EMAIL_REPLACED"));
         assert!(result.contains("DOMAIN_REPLACED"));
         assert!(!result.contains("@company.com"));
+    }
+
+    // ── #14: --exclude domain / --exclude email ─────────
+
+    /// Engine-level check of the protection mechanism `apply_pairs_protected`
+    /// adds for #14: a literal in `protect` must win the leftmost-longest race
+    /// against a *shorter*, unrelated pattern nested inside it, and come back
+    /// out byte-for-byte — including whatever case the source used, not the
+    /// case the pattern happened to be recorded in.
+    #[test]
+    fn protected_literal_survives_nested_domain_replacement_case_and_all() {
+        let content = "mail Admin@ACME-Corp.COM and bare acme-corp.com alone";
+        let mut map = AnonymizationMap::new();
+        map.domains
+            .insert("acme-corp.com".into(), "RANDOM123xyz.com".into());
+        map.protected_emails.insert("admin@acme-corp.com".into());
+
+        let result = apply_legacy(content, &map);
+        assert!(
+            result.contains("Admin@ACME-Corp.COM"),
+            "protected email must survive verbatim, case included: {result}"
+        );
+        assert!(
+            result.contains("bare RANDOM123xyz.com alone"),
+            "the unrelated, standalone domain occurrence must still be \
+             anonymized: {result}"
+        );
+    }
+
+    /// build_map()'s STEP 2 must not resurrect a domain mapping that
+    /// `--exclude domain` emptied, just because the domain also shows up as
+    /// the second half of an email — that resurrection is the #14 bug.
+    /// `map.domains` must stay empty, and the email replacement must keep the
+    /// domain half exactly as found while still anonymizing the local part.
+    #[test]
+    fn build_map_exclude_domain_does_not_reinsert_domain_via_email() {
+        let mut raw = ExtractedEntities::default();
+        raw.emails.insert("admin@acme-corp.com".to_string());
+        raw.domains.insert("acme-corp.com".to_string());
+        let exclude = ExcludeFilter::from_strings(&["domain".into()]).unwrap();
+        let cfg = ExtractConfig::default();
+
+        let map = build_map(raw, &exclude, &cfg);
+
+        assert!(
+            map.domains.is_empty(),
+            "domain must stay excluded even though it was seen via an email, \
+             got: {:?}",
+            map.domains
+        );
+        let email_repl = map
+            .emails
+            .get("admin@acme-corp.com")
+            .expect("email itself was not excluded, so it must be anonymized");
+        assert!(
+            email_repl.ends_with("@acme-corp.com"),
+            "domain half of the address must be left exactly as found once \
+             domain is excluded, got: {email_repl}"
+        );
+        assert!(
+            !email_repl.starts_with("admin@"),
+            "local half must still be anonymized — only domain is excluded here, \
+             got: {email_repl}"
+        );
+    }
+
+    /// build_map() must record every email skipped by `--exclude email` in
+    /// `protected_emails`, so `apply_pairs_protected` can shield them later —
+    /// otherwise the domain half gets rewritten by the (unrelated, still
+    /// active) domain pass. See `protected_literal_survives_nested_domain_replacement_case_and_all`
+    /// for the mechanism this feeds.
+    #[test]
+    fn build_map_exclude_email_records_protected_emails() {
+        let mut raw = ExtractedEntities::default();
+        raw.emails.insert("admin@acme-corp.com".to_string());
+        raw.domains.insert("acme-corp.com".to_string());
+        let exclude = ExcludeFilter::from_strings(&["email".into()]).unwrap();
+        let cfg = ExtractConfig::default();
+
+        let map = build_map(raw, &exclude, &cfg);
+
+        assert!(
+            map.emails.is_empty(),
+            "excluded email must not get a map.emails entry"
+        );
+        assert!(
+            map.protected_emails.contains("admin@acme-corp.com"),
+            "excluded email must be recorded as protected so the domain pass \
+             can't reach into it, got: {:?}",
+            map.protected_emails
+        );
+        // The domain itself is not excluded, so it's still anonymized —
+        // exactly the tension #14 asked us to resolve, not to erase.
+        assert!(
+            !map.domains.is_empty(),
+            "domain is not excluded here and must still be anonymized"
+        );
+    }
+
+    /// With nothing excluded, `protected_emails` must stay empty — the
+    /// mechanism must be a no-op on the overwhelmingly common path.
+    #[test]
+    fn build_map_no_exclusion_leaves_protected_emails_empty() {
+        let mut raw = ExtractedEntities::default();
+        raw.emails.insert("admin@acme-corp.com".to_string());
+        raw.domains.insert("acme-corp.com".to_string());
+        let cfg = ExtractConfig::default();
+
+        let map = build_map(raw, &ExcludeFilter::none(), &cfg);
+
+        assert!(
+            map.protected_emails.is_empty(),
+            "no exclusion is in force, so nothing should be protected: {:?}",
+            map.protected_emails
+        );
+        assert!(!map.emails.is_empty());
+        assert!(!map.domains.is_empty());
     }
 
     /// Round-trip: anonymize then reverse must yield the original.
@@ -5364,6 +5933,138 @@ mod tests {
             r.macs_compact.iter().any(|m| m == "005056962A77"),
             "Got: {:?}",
             r.macs_compact
+        );
+    }
+
+    /// #13: a colon MAC containing hex letters (the VMware OUI `00:50:56:...`
+    /// is the common case, not the exotic one) is also a syntactic match for
+    /// the loose IPv6 pattern. It must land in `macs_colon` only — never in
+    /// `ipv6s` — so it gets the MAC mask and `--exclude mac` can preserve it.
+    /// The all-digit MAC from the same report must land the same way, so this
+    /// isn't a regression on the case that already worked.
+    #[test]
+    fn mac_with_hex_letters_claimed_by_mac_channel_not_ipv6() {
+        let content = "hexmac 00:50:56:96:AA:77 digitmac 00:11:22:33:44:55";
+        let cfg = ExtractConfig::default();
+        let r = extract_entities(content, &cfg);
+        assert!(
+            r.macs_colon.iter().any(|m| m == "00:50:56:96:AA:77"),
+            "Got macs_colon: {:?}",
+            r.macs_colon
+        );
+        assert!(
+            r.macs_colon.iter().any(|m| m == "00:11:22:33:44:55"),
+            "Got macs_colon: {:?}",
+            r.macs_colon
+        );
+        assert!(
+            !r.ipv6s
+                .iter()
+                .any(|i| i.eq_ignore_ascii_case("00:50:56:96:AA:77")),
+            "hex-letter MAC must not also be claimed by the IPv6 channel. Got ipv6s: {:?}",
+            r.ipv6s
+        );
+        assert!(
+            r.ipv6s.is_empty(),
+            "digit-only MAC was never IPv6-shaped enough to pass should_anonymize_ipv6 \
+             anyway, so ipv6s should stay empty. Got: {:?}",
+            r.ipv6s
+        );
+    }
+
+    /// A hex-letter MAC alongside a genuine IPv6 address in the same content:
+    /// the MAC must go to the MAC channel and the real address must still be
+    /// picked up by the IPv6 channel — the fix must not turn into "nothing
+    /// with a colon and a hex letter is ever IPv6 again".
+    #[test]
+    fn mac_and_genuine_ipv6_both_detected_in_same_content() {
+        let content = "hexmac 00:50:56:96:AA:77 and address 2a01:cb05:8c57:6800:250:56ff:fe96:aa77";
+        let cfg = ExtractConfig::default();
+        let r = extract_entities(content, &cfg);
+        assert!(
+            r.macs_colon.iter().any(|m| m == "00:50:56:96:AA:77"),
+            "Got macs_colon: {:?}",
+            r.macs_colon
+        );
+        assert!(
+            r.ipv6s.iter().any(|i| i.contains("2a01:cb05")),
+            "Genuine IPv6 must still be detected. Got ipv6s: {:?}",
+            r.ipv6s
+        );
+    }
+
+    /// End-to-end: a hex-letter MAC must come out the other side wearing the
+    /// documented MAC mask (`**:**:**:**:**:XX`), not the IPv6 mask
+    /// (`****:...:XX`) it used to get when the IPv6 channel claimed it first.
+    #[test]
+    fn mac_with_hex_letters_gets_mac_mask_end_to_end() {
+        let content = "hexmac 00:50:56:96:AA:77 digitmac 00:11:22:33:44:55";
+        let cfg = ExtractConfig::default();
+        let raw = extract_entities(content, &cfg);
+        let map = build_map(raw, &ExcludeFilter::none(), &cfg);
+        let result = apply_replacements(content, &map, &ExcludeFilter::none());
+        assert!(
+            result.contains("**:**:**:**:**:77"),
+            "hex-letter MAC must get the MAC mask. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("**:**:**:**:**:55"),
+            "digit-only MAC must keep getting the MAC mask. Got: {}",
+            result
+        );
+        assert!(!result.contains("00:50:56:96:AA:77"));
+        assert!(!result.contains("00:11:22:33:44:55"));
+    }
+
+    /// `--exclude mac` must preserve a hex-letter MAC exactly like an
+    /// all-digit one — the whole point of #13. Before the fix, the
+    /// hex-letter MAC was silently anonymized anyway because it was sitting
+    /// in `ipv6s`, a set `--exclude mac` never touches.
+    #[test]
+    fn exclude_mac_preserves_hex_letter_and_digit_macs() {
+        let content = "hexmac 00:50:56:96:AA:77 digitmac 00:11:22:33:44:55";
+        let cfg = ExtractConfig::default();
+        let raw = extract_entities(content, &cfg);
+        let exclude = ExcludeFilter::from_strings(&["mac".into()]).unwrap();
+        let map = build_map(raw, &exclude, &cfg);
+        let result = apply_replacements(content, &map, &exclude);
+        assert!(
+            result.contains("00:50:56:96:AA:77"),
+            "hex-letter MAC must be preserved by --exclude mac. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("00:11:22:33:44:55"),
+            "digit-only MAC must be preserved by --exclude mac. Got: {}",
+            result
+        );
+    }
+
+    /// `--exclude ipv6` must still preserve a genuine IPv6 address, and must
+    /// have no bearing on MAC masking — the two channels stay independent.
+    #[test]
+    fn exclude_ipv6_preserves_ipv6_but_mac_is_still_masked() {
+        let content = "hexmac 00:50:56:96:AA:77 and address 2a01:cb05:8c57:6800:250:56ff:fe96:aa77";
+        let cfg = ExtractConfig::default();
+        let raw = extract_entities(content, &cfg);
+        let exclude = ExcludeFilter::from_strings(&["ipv6".into()]).unwrap();
+        let map = build_map(raw, &exclude, &cfg);
+        let result = apply_replacements(content, &map, &exclude);
+        assert!(
+            result.contains("2a01:cb05:8c57:6800:250:56ff:fe96:aa77"),
+            "--exclude ipv6 must preserve the genuine IPv6 address. Got: {}",
+            result
+        );
+        assert!(
+            !result.contains("00:50:56:96:AA:77"),
+            "MAC masking must be unaffected by --exclude ipv6. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("**:**:**:**:**:77"),
+            "MAC must still get the MAC mask. Got: {}",
+            result
         );
     }
 

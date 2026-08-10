@@ -101,6 +101,49 @@ both survive). Staged files are hard-linked where the filesystem allows it, so a
 is not duplicated; a temp directory on a different volume than the input falls back to copying.
 The staging tree is removed on every exit path.
 
+**Coverage reporting stays on with the flag.** Staging only ever moves files that are already in
+the active extension set, so the ordinary directory walk that runs afterwards, over the staged
+tree rather than the real input, would always find a clean floor — nothing outside the set is ever
+placed there to trip its report. Left alone, that made `--expand-archives` the one thing that
+turned the coverage warning *off*: a `.reg` sitting next to the archive was still dropped, only the
+message saying so disappeared. Staging now tallies what it leaves behind itself — a plain
+out-of-set file in the directory and an out-of-set entry found inside an archive are both counted
+— and reports them with the same wording the non-expanding run uses, before the second walk ever
+starts.
+
+An archive found *inside* an archive is not opened, in either input mode. Reading one needs random
+access into an entry that offers only a forward-only decompression stream, so it would have to be
+materialised whole first — two stacked compression layers instead of one, which is the shape a zip
+bomb exploits. It is named and reported as **not covered**, deliberately not folded into the
+unhandled-extension report above: that one ends with "add text types with `--ext`", and no flag
+reaches a second archive layer, so calling it "skipped" would imply one exists.
+
+```
+  ⚠ 1 archive(s) found inside another archive — NOT covered:
+      Outer.zip::Inner.zip
+    An archive nested one layer deeper is not opened: reading it needs random
+    access into a forward-only decompression stream, so it would have to be
+    materialised whole first — two stacked compression layers, the shape a zip
+    bomb exploits. Deliberately no flag reaches this far, which is why this is
+    worded as not covered rather than skipped.
+    Its contents are neither anonymized nor written to the output in any form
+    — extract it separately and re-run if it needs covering.
+```
+
+The last line differs by input mode, because the outcome does: expanding a directory leaves the
+nested archive out of the output entirely, while a `.zip` input copies it through byte-for-byte —
+so in that case the archive *is* in the bundle you send on, with its contents unanonymized.
+
+Both reports come from the staging step itself, so a run never shows two summaries that disagree:
+the ordinary directory walk that runs afterwards, over the now-complete staged tree, has nothing
+left to add.
+
+`zip` is refused as a value for `--ext` / `--only-ext`. An archive is not text: decoding it,
+rewriting the bytes that happen to match an entity and re-encoding produces a corrupt archive
+rather than an anonymized one, and a `.zip` claimed as text also shadows the archive handling
+itself — it gets staged as an ordinary file, so `--expand-archives` reports `Expanded 0 archive(s)`
+and its entries are never covered nor mentioned. The flag is ignored with a warning.
+
 ### Fewer false positives in JSON-encoded traces
 
 `.trace` files are JSON per line, where a literal backslash is written `\\`. A lone backslash is
@@ -109,6 +152,80 @@ therefore always an escape, but `RE_DOMAIN_USER` read `col1\tsep2` as domain `co
 left `--paranoid` reporting phantom leaks. Single-backslash escapes (`\b \f \n \r \t \uXXXX`) are
 no longer treated as `DOMAIN\user` in JSON-encoded content. Plain-text `.log` detection is
 unchanged.
+
+## What's new in v2.7.3
+
+Three defects where a flag or a report did not do what it said. All three predate v2.7.
+
+### `--exclude mac` now preserves MAC addresses with hex letters (#13)
+
+A colon MAC containing hex letters also satisfied the IPv6 heuristic, so it was claimed by both
+channels — and since `--exclude mac` only empties the MAC sets, the address stayed anonymized
+through the untouched IPv6 one. It also got the IPv6 mask rather than the `**:**:**:**:**:77` form
+this README documents. `00:50:56` is the VMware OUI, so hex-letter MACs are the norm in a Veeam
+bundle, not the exception; the all-digit case worked only by accident of having no `a`–`f` digit.
+
+The MAC channel now claims MAC-shaped strings first, standing aside only when two things both
+hold: the match is immediately preceded by `::`, **and** the IPv6 pattern actually matches at that
+position and passes the same gate the IPv6 pass applies.
+
+The `::` is what makes the match a fragment rather than a whole value: the IPv6 pattern needs two
+groups before a `::`, so it cannot begin at `fd00` in `fd00::aa:bb:cc:dd:ee:ff` and captures only
+the tail. That is the one case the hand-off is for. A bare `00:50:56:96:AA:77` belongs to the MAC
+channel, which is what #13 is about.
+
+The second half asks the pattern instead of approximating it, and that distinction is the whole
+lesson here. Every proxy for "IPv6 will take this" let some shape slip through to *neither* channel:
+backing off on any adjacent colon dropped `Adapter:00-50-56-96-AA-78`; backing off on the `::`
+prefix alone dropped `::00-50-56-96-AA-61` and `fd00::00:11:22:33:44:63`; adding "is
+colon-separated" still dropped `fd00::aa-bb:cc-dd:ee-ff`, because the MAC pattern alternates `:`
+and `-` *per separator* while the IPv6 pattern cannot cross a `-`. Each of those shipped in clear
+with no flags — and `--paranoid` cannot see it, because an entity in no map is in no scan list.
+
+`--exclude ipv6` changes too, in the same direction: a compressed address whose tail happens to be
+six two-hex-digit groups (`fd00::aa:bb:cc:dd:ee:ff`) used to be masked *through the MAC channel*
+even with `ipv6` excluded, because the MAC channel backstopped it. It is a genuine IPv6 address, so
+`--exclude ipv6` now preserves it as asked.
+
+Note that the loopback, unspecified and all-nodes addresses (`::1`, `::`, `ff02::1`) and `fe80::1`
+are deliberately left visible, as before — a full tail such as `fe80::1234:5678:9abc:def0` is still
+masked.
+
+The invariant behind all of this is asserted directly in the test suite: no MAC-shaped match may end
+up claimed by *neither* channel. (Both claiming it is allowed and harmless — it means the value is
+masked twice over.) Three attempts at this hand-off each dropped a different shape, and none of them
+showed up in a shape-by-shape corpus until someone tried that shape, so the property is asserted
+rather than reasoned about — the test is verified to fail on each of the earlier versions.
+
+The `--exclude` help text also listed only 9 of the 16 types the parser accepts; it now lists all
+of them.
+
+### `--exclude domain` is no longer undone by the email path (#14)
+
+Building an email's replacement fabricated a domain mapping and registered it — but that branch
+could only run once `--exclude domain` had emptied the map, so it existed solely to re-create the
+mapping the operator asked to skip, and it applied to *every* occurrence of that domain, not just
+the one inside the address. The run contradicted itself in its own output:
+
+```
+  Skipped 1 domain(s) (excluded)
+  Found: 1 emails, 0 users, 1 domains, ...      <- 1 domain, right after "Skipped"
+```
+
+`--exclude email` also changed: it now preserves the whole address instead of keeping the local
+part and rewriting the domain, which was neither readable nor anonymized. See
+[`domain` and `email` overlap](#domain-and-email-overlap--how-the-two-compose) for how the two
+flags compose. The protection applies to file and zip-entry names too, not only content — an
+address kept in the body while the file name carried a rewritten domain half would be the same
+half-anonymized result one step further along.
+
+### `--expand-archives` no longer silences the coverage report (#15)
+
+Passing the flag turned off the very warning that says coverage is incomplete, because staging
+places only in-set files and the walk that follows therefore found a clean floor. Staging now
+tallies what it leaves behind itself. A `.zip` nested inside an expanded archive is reported as
+**not covered** rather than vanishing. Details in the
+[`--expand-archives` section](#--expand-archives--nested-zip-archives) above.
 
 ## What's new in v2.7.2
 
@@ -460,6 +577,14 @@ veeam-log-anonymizer -d ./logs -o ./output -f -e ip,ipv6
 
 # Disable PEM redaction (rare — need to inspect certificate chain)
 veeam-log-anonymizer -d ./logs -o ./output -f -e pem
+
+# Keep company domains readable but still anonymize who sent what:
+# admin@acme-corp.com -> k8mN2xpQ@acme-corp.com (local part anonymized, domain kept)
+veeam-log-anonymizer -d ./logs -o ./output -f -e domain
+
+# Keep whole addresses readable but still anonymize other domains (see
+# "domain and email overlap" below for how the two flags compose)
+veeam-log-anonymizer -d ./logs -o ./output -f -e email
 ```
 
 ## Options
@@ -496,6 +621,29 @@ veeam-log-anonymizer -d ./logs -o ./output -f -e pem
 ### `--exclude` accepted types
 
 `email`, `user`, `domain`, `ip`, `ipv6`, `mac`, `ssh-fp`, `backup-file`, `naked-user`, `fqdn`, `hostname`, `object`, `db`, `pem`, `private-key`, `jwt`
+
+### `domain` and `email` overlap — how the two compose
+
+A "domain" is only ever discovered as the second half of an email address (see
+the *Domains (from emails)* row below), and the same domain string is then
+replaced everywhere it appears in the corpus — bare or not — so the same
+organization always maps to the same anonymized name. `domain` and `email`
+therefore interact:
+
+- `-e domain`: every occurrence of the domain is left alone, including the
+  domain half of an address that isn't itself excluded — e.g.
+  `admin@acme-corp.com` becomes `k8mN2xpQ@acme-corp.com` (local part
+  anonymized, domain kept), and a standalone `acme-corp.com` elsewhere in the
+  same run is left untouched too. This holds under `--aggressive` as well: a
+  3+-segment domain such as `mail.acme-corp.com` is also an FQDN, and the FQDN
+  channel honours the exclusion rather than rewriting the standalone
+  occurrence while the address keeps it.
+- `-e email`: the entire address is preserved byte-for-byte, domain half
+  included — a half-rewritten address (original local part, randomized
+  domain) is neither anonymized nor readable, which is worse than either. A
+  domain that appears *outside* an excluded email is a separate occurrence and
+  is still anonymized, unless `domain` is excluded too.
+- `-e domain,email`: both the addresses and every domain are fully preserved.
 
 ## What gets anonymized
 
