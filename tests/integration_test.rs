@@ -4023,3 +4023,141 @@ fn exclude_domain_holds_through_the_fqdn_channel() {
         "the standalone occurrence must be preserved like the one in the address: {got}"
     );
 }
+
+/// A `.zip` entry inside a `.zip` input used to be bucketed with unhandled
+/// extensions, whose report ends with "add text types with --ext". Following that
+/// advice decodes and rewrites a binary file: the nested archive comes out corrupt
+/// ("Bad magic number for central directory") rather than anonymized.
+#[test]
+fn nested_archive_in_zip_input_is_not_advised_as_an_extension() {
+    let dir = TempDir::new().unwrap();
+    let inner = dir.path().join("Inner.zip");
+    make_zip(&inner, &[("Deep.log", "deep carol@corp.com\n")]);
+    let inner_bytes = fs::read(&inner).unwrap();
+
+    let bundle = dir.path().join("bundle.zip");
+    {
+        use std::io::Write;
+        let f = fs::File::create(&bundle).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file("ok.log", opts).unwrap();
+        zw.write_all(b"ok admin@corp.com\n").unwrap();
+        zw.start_file("Inner.zip", opts).unwrap();
+        zw.write_all(&inner_bytes).unwrap();
+        zw.finish().unwrap();
+    }
+
+    let out_zip = dir.path().join("anon.zip");
+    let o = run(&[
+        "-d",
+        bundle.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+    ]);
+    assert!(o.status.success());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("found inside another archive") && stderr.contains("bundle.zip::Inner.zip"),
+        "the nested archive must get the not-covered message. stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("1 .zip"),
+        "it must not be listed as an unhandled extension. stderr: {stderr}"
+    );
+}
+
+/// `zip` is not a text extension. Accepting it decodes the archive, rewrites bytes
+/// that happen to match an entity and re-encodes — producing a corrupt archive —
+/// and also shadows archive handling, so `--expand-archives` never expands.
+#[test]
+fn zip_is_refused_as_a_text_extension() {
+    let dir = TempDir::new().unwrap();
+    let inner = dir.path().join("Inner.zip");
+    make_zip(&inner, &[("Deep.log", "deep carol@corp.com\n")]);
+    let inner_bytes = fs::read(&inner).unwrap();
+
+    let bundle = dir.path().join("bundle.zip");
+    {
+        use std::io::Write;
+        let f = fs::File::create(&bundle).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file("Inner.zip", opts).unwrap();
+        zw.write_all(&inner_bytes).unwrap();
+        zw.finish().unwrap();
+    }
+
+    let out_zip = dir.path().join("anon.zip");
+    let o = run(&[
+        "-d",
+        bundle.to_str().unwrap(),
+        "--output-zip",
+        out_zip.to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--ext",
+        "zip",
+    ]);
+    assert!(o.status.success());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(
+        stderr.matches("Ignoring `zip`").count(),
+        1,
+        "warned exactly once. stderr: {stderr}"
+    );
+
+    // The nested archive must come out byte-identical, still a readable zip.
+    let out = fs::File::open(&out_zip).unwrap();
+    let mut archive = zip::ZipArchive::new(out).unwrap();
+    let mut got = Vec::new();
+    {
+        use std::io::Read;
+        archive
+            .by_name("Inner.zip")
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+    }
+    assert_eq!(got, inner_bytes, "the nested archive was corrupted");
+}
+
+/// The same refusal must not disable expansion: with `--ext zip` the archive is
+/// still an archive, so `--expand-archives` covers its entries.
+#[test]
+fn ext_zip_does_not_disable_expansion() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    make_zip(
+        &src.path().join("rot.zip"),
+        &[("r.log", "r bob@corp.com 10.4.4.4\n")],
+    );
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--expand-archives",
+        "--ext",
+        "zip",
+    ]);
+    assert!(o.status.success());
+    let names = rel_paths(out.path());
+    assert!(
+        names.iter().any(|n| n.contains("rot.zip.extracted")),
+        "the archive must still be expanded: {names:?}"
+    );
+    for p in collect_files(out.path()) {
+        let c = fs::read_to_string(&p).unwrap_or_default();
+        assert!(
+            !c.contains("bob@corp.com"),
+            "{} not anonymized",
+            p.display()
+        );
+    }
+}

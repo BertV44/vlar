@@ -111,29 +111,38 @@ out-of-set file in the directory and an out-of-set entry found inside an archive
 — and reports them with the same wording the non-expanding run uses, before the second walk ever
 starts.
 
-An archive found *inside* an archive being expanded (VB365 bundles nest rotated logs this way) is
-not expanded in turn. Recursing needs random access into an entry that only offers a forward-only
-decompression stream, and the only way to get that is to fully materialize the nested archive
-first — in memory, or to a scratch file — which reopens exactly the amplification a streaming copy
-is careful to avoid: two independent compression layers instead of one is the shape a zip bomb
-exploits, however small the extra depth looks. So a nested archive is named and reported as **not
-covered** instead of being expanded:
+An archive found *inside* an archive is not opened, in either input mode. Reading one needs random
+access into an entry that offers only a forward-only decompression stream, so it would have to be
+materialised whole first — two stacked compression layers instead of one, which is the shape a zip
+bomb exploits. It is named and reported as **not covered**, deliberately not folded into the
+unhandled-extension report above: that one ends with "add text types with `--ext`", and no flag
+reaches a second archive layer, so calling it "skipped" would imply one exists.
 
 ```
-  ⚠ 1 archive(s) found nested inside an expanded archive — NOT covered:
+  ⚠ 1 archive(s) found inside another archive — NOT covered:
       Outer.zip::Inner.zip
-    --expand-archives does not recurse into an archive found inside another
-    archive. This content is neither anonymized nor written to the output in
-    any form — extract it separately and re-run if it needs covering.
+    An archive nested one layer deeper is not opened: reading it needs random
+    access into a forward-only decompression stream, so it would have to be
+    materialised whole first — two stacked compression layers, the shape a zip
+    bomb exploits. Deliberately no flag reaches this far, which is why this is
+    worded as not covered rather than skipped.
+    Its contents are neither anonymized nor written to the output in any form
+    — extract it separately and re-run if it needs covering.
 ```
 
-That wording is deliberately not folded into the unhandled-extension report above: that one is
-about an extension the operator can widen coverage for with `--ext`, and there is no flag that
-reaches inside a second archive layer — saying "skipped" would imply one exists.
+The last line differs by input mode, because the outcome does: expanding a directory leaves the
+nested archive out of the output entirely, while a `.zip` input copies it through byte-for-byte —
+so in that case the archive *is* in the bundle you send on, with its contents unanonymized.
 
 Both reports come from the staging step itself, so a run never shows two summaries that disagree:
 the ordinary directory walk that runs afterwards, over the now-complete staged tree, has nothing
 left to add.
+
+`zip` is refused as a value for `--ext` / `--only-ext`. An archive is not text: decoding it,
+rewriting the bytes that happen to match an entity and re-encoding produces a corrupt archive
+rather than an anonymized one, and a `.zip` claimed as text also shadows the archive handling
+itself — it gets staged as an ordinary file, so `--expand-archives` reports `Expanded 0 archive(s)`
+and its entries are never covered nor mentioned. The flag is ignored with a warning.
 
 ### Fewer false positives in JSON-encoded traces
 

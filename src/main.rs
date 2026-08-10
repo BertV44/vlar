@@ -864,25 +864,44 @@ impl Cli {
     /// anonymized nor copied, so the run reported success on a partial result.
     fn text_extensions(&self) -> BTreeSet<String> {
         let normalize = |s: &String| s.trim().trim_start_matches('.').to_ascii_lowercase();
-        if !self.only_extensions.is_empty() {
-            return self
-                .only_extensions
+        let mut set: BTreeSet<String> = if !self.only_extensions.is_empty() {
+            self.only_extensions
                 .iter()
                 .map(normalize)
                 .filter(|s| !s.is_empty())
-                .collect();
-        }
-        let mut set: BTreeSet<String> = DEFAULT_TEXT_EXTENSIONS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        set.extend(
-            self.extra_extensions
+                .collect()
+        } else {
+            let mut set: BTreeSet<String> = DEFAULT_TEXT_EXTENSIONS
                 .iter()
-                .map(normalize)
-                .filter(|s| !s.is_empty()),
-        );
+                .map(|s| s.to_string())
+                .collect();
+            set.extend(
+                self.extra_extensions
+                    .iter()
+                    .map(normalize)
+                    .filter(|s| !s.is_empty()),
+            );
+            set
+        };
+        // `zip` can never be a *text* extension. Treating an archive as text decodes
+        // it, rewrites bytes that happen to match an entity, and re-encodes — the
+        // result is a corrupt archive ("Bad magic number for central directory"),
+        // not an anonymized one. It also shadows the archive handling itself: a
+        // `.zip` claimed as text is hard-linked into staging instead of being
+        // expanded, so `--expand-archives` reports "Expanded 0 archive(s)" and the
+        // contents are neither covered nor mentioned.
+        set.remove("zip");
         set
+    }
+
+    /// True when the caller asked for `zip` and it was dropped, so `run` can say so
+    /// once rather than every time the set is rebuilt.
+    fn asked_for_zip_extension(&self) -> bool {
+        let normalize = |s: &String| s.trim().trim_start_matches('.').to_ascii_lowercase();
+        self.only_extensions
+            .iter()
+            .chain(self.extra_extensions.iter())
+            .any(|e| normalize(e) == "zip")
     }
 
     /// The active extension set, formatted for messages.
@@ -3033,31 +3052,41 @@ fn report_unhandled_extensions(skipped: &BTreeMap<String, usize>, fate: Unhandle
 /// extension the operator can widen coverage for with `--ext`; there is no
 /// flag that reaches inside a second archive layer, so the message says so
 /// plainly rather than implying one more flag would fix it.
-fn report_nested_archives(nested: &[String]) {
+fn report_nested_archives(nested: &[String], copied_through: bool) {
     if nested.is_empty() {
         return;
     }
     eprintln!(
-        "  ⚠ {} archive(s) found nested inside an expanded archive — NOT covered:",
+        "  ⚠ {} archive(s) found inside another archive — NOT covered:",
         nested.len()
     );
     for name in nested {
         eprintln!("      {name}");
     }
-    eprintln!("    --expand-archives does not recurse into an archive found inside another");
-    eprintln!("    archive. This content is neither anonymized nor written to the output in");
-    eprintln!("    any form — extract it separately and re-run if it needs covering.");
+    eprintln!("    An archive nested one layer deeper is not opened: reading it needs random");
+    eprintln!("    access into a forward-only decompression stream, so it would have to be");
+    eprintln!("    materialised whole first — two stacked compression layers, the shape a zip");
+    eprintln!("    bomb exploits. Deliberately no flag reaches this far, which is why this is");
+    eprintln!("    worded as not covered rather than skipped.");
+    if copied_through {
+        eprintln!("    The archive itself is copied into the output byte-for-byte, so whatever it");
+        eprintln!("    holds is NOT anonymized. Extract it separately and re-run.");
+    } else {
+        eprintln!("    Its contents are neither anonymized nor written to the output in any form");
+        eprintln!("    — extract it separately and re-run if it needs covering.");
+    }
 }
 
 /// Tally the zip entries that fall outside the active extension set, by extension.
 ///
 /// Reads the central directory only — no entry is decompressed.
-fn tally_zip_unhandled(zip_path: &Path) -> Result<BTreeMap<String, usize>> {
+fn tally_zip_unhandled(zip_path: &Path) -> Result<(BTreeMap<String, usize>, Vec<String>)> {
     let file = fs::File::open(zip_path)
         .with_context(|| format!("Failed to open zip: {}", zip_path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("Failed to read zip: {}", zip_path.display()))?;
     let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+    let mut nested: Vec<String> = Vec::new();
     for i in 0..archive.len() {
         let Ok(entry) = archive.by_index(i) else {
             continue;
@@ -3074,9 +3103,21 @@ fn tally_zip_unhandled(zip_path: &Path) -> Result<BTreeMap<String, usize>> {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
+        // An archive inside the bundle is not an "unhandled extension": the report
+        // for those ends with "add text types with --ext", and following that advice
+        // for a `.zip` decodes and rewrites a binary file, producing a corrupt
+        // archive rather than an anonymized one. It gets the nested-archive message,
+        // which says the content is not covered and offers no flag that would be.
+        if ext == "zip" {
+            nested.push(format!(
+                "{}::{name}",
+                zip_path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            continue;
+        }
         *skipped.entry(extension_label(&ext)).or_insert(0) += 1;
     }
-    Ok(skipped)
+    Ok((skipped, nested))
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3799,6 +3840,12 @@ fn run() -> Result<i32> {
     // Publish the extension set before any scanning: the zip entry gate reads it
     // through a global, and an unset global would silently fall back to defaults.
     let _ = TEXT_EXTENSIONS.set(cli.text_extensions());
+    if cli.asked_for_zip_extension() {
+        eprintln!("  ⚠ Ignoring `zip` in the extension set: an archive is not text, and");
+        eprintln!("    anonymizing it as text would corrupt it — the bytes that happen to match");
+        eprintln!("    an entity get rewritten and the archive stops being readable. Use");
+        eprintln!("    --expand-archives to cover the entries inside archives in a directory.");
+    }
 
     // Nested archives: stage the directory's text files and the archives' text
     // entries under one root, then point the pipeline at it. Held in scope so the
@@ -3835,7 +3882,7 @@ fn run() -> Result<i32> {
                 // the exact silence #15 was filed over: the flag that exists to
                 // improve coverage was what hid the remaining gap.
                 report_unhandled_extensions(&stats.skipped, UnhandledFate::Dropped);
-                report_nested_archives(&stats.nested_archives);
+                report_nested_archives(&stats.nested_archives, false);
                 cli.input_directory = Some(staged.0.clone());
                 Some(staged)
             }
@@ -4473,10 +4520,9 @@ fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i3
 
     // Say what will be copied through untouched, before doing it — same reporting
     // the directory walk gives, so the two input modes agree on coverage.
-    report_unhandled_extensions(
-        &tally_zip_unhandled(&zip_path)?,
-        UnhandledFate::CopiedVerbatim,
-    );
+    let (zip_skipped, zip_nested) = tally_zip_unhandled(&zip_path)?;
+    report_unhandled_extensions(&zip_skipped, UnhandledFate::CopiedVerbatim);
+    report_nested_archives(&zip_nested, true);
 
     // Phase 1: scan
     let (raw, file_count) = scan_zip_entities(&zip_path, cfg)?;
