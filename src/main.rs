@@ -1239,14 +1239,49 @@ fn anonymize_ipv6(ipv6: &str) -> String {
 }
 
 /// Anonymize a colon/hyphen-separated MAC: keep the last byte (last 2 hex).
+///
+/// `RE_MAC_COLON` is `([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}` — the `[:-]`
+/// alternates *per separator*, so one match can freely mix the two, e.g.
+/// `aa-bb:cc-dd:ee-ff`. Picking a single separator up front by asking
+/// whether the string contains a colon anywhere (the previous approach)
+/// then splitting on only that character undercounts the groups for any
+/// mixed match, so the `len == 6` check failed and the MAC shipped in
+/// clear — the whole of #22. Splitting on either character at once handles
+/// a mixed match the same way it handles a consistent one, with no separate
+/// case for "mixed" at all.
+///
+/// The mask keeps each separator exactly where it was rather than forcing
+/// the run to one kind: the point of masking is hiding the address, not the
+/// punctuation, and a support engineer reading `**-**:**-**:**-ff` still
+/// recognizes it as a MAC. Narrowing the regex to reject mixed separators
+/// instead (so it simply stops matching them) was considered and rejected —
+/// that would silence `--paranoid` on exactly this shape too, since an
+/// entity nothing detects is an entity in no map, and an entity in no map
+/// is in no scan list. A flagged leak is recoverable; a silent one is not.
 fn anonymize_mac_colon(mac: &str) -> String {
-    let sep = if mac.contains(':') { ':' } else { '-' };
-    let parts: Vec<&str> = mac.split(sep).collect();
-    if parts.len() == 6 {
-        format!("**{0}**{0}**{0}**{0}**{0}{1}", sep, parts[5])
-    } else {
-        mac.to_string()
+    let mut groups: Vec<&str> = Vec::with_capacity(6);
+    let mut seps: Vec<char> = Vec::with_capacity(5);
+    let mut start = 0;
+    for (i, c) in mac.char_indices() {
+        if c == ':' || c == '-' {
+            groups.push(&mac[start..i]);
+            seps.push(c);
+            start = i + c.len_utf8();
+        }
     }
+    groups.push(&mac[start..]);
+
+    if groups.len() != 6 {
+        return mac.to_string();
+    }
+
+    let mut result = String::with_capacity(mac.len());
+    for sep in &seps {
+        result.push_str("**");
+        result.push(*sep);
+    }
+    result.push_str(groups[5]);
+    result
 }
 
 /// Anonymize a compact 12-hex MAC: keep last 2 hex chars.
@@ -6066,6 +6101,139 @@ mod tests {
             "MAC must still get the MAC mask. Got: {}",
             result
         );
+    }
+
+    /// #22: `RE_MAC_COLON` alternates `[:-]` per separator, so a single match
+    /// can mix the two. `anonymize_mac_colon` used to pick one separator by
+    /// asking whether the whole string contained a colon anywhere, then split
+    /// on only that character — a mixed match undercounted its groups and
+    /// came back unchanged, in clear. Several spellings, each masked with
+    /// every separator preserved in place.
+    #[test]
+    fn mixed_separator_mac_masked_with_separators_preserved() {
+        let cases = [
+            ("aa-bb:cc-dd:ee-ff", "**-**:**-**:**-ff"),
+            ("00:50-56:96-AA:33", "**:**-**:**-**:33"),
+            ("00:50-56-96-AA:33", "**:**-**-**-**:33"),
+            ("aa:bb:cc:dd-ee-ff", "**:**:**:**-**-ff"),
+            ("aa-bb-cc-dd-ee:ff", "**-**-**-**-**:ff"),
+        ];
+        for (mac, expected) in cases {
+            assert_eq!(
+                anonymize_mac_colon(mac),
+                expected,
+                "mixed-separator MAC {mac:?} masked wrong"
+            );
+        }
+    }
+
+    /// Same shapes, end to end: the raw mixed-separator MAC must not survive
+    /// in the output, and the mask must land with every separator preserved
+    /// — not just the unit-level render function in isolation.
+    #[test]
+    fn mixed_separator_mac_masked_end_to_end() {
+        let content = "A aa-bb:cc-dd:ee-ff B 00:50-56:96-AA:33";
+        let cfg = ExtractConfig::default();
+        let raw = extract_entities(content, &cfg);
+        let map = build_map(raw, &ExcludeFilter::none(), &cfg);
+        let result = apply_replacements(content, &map, &ExcludeFilter::none());
+        assert!(
+            !result.contains("aa-bb:cc-dd:ee-ff"),
+            "mixed-separator MAC must not survive in clear. Got: {}",
+            result
+        );
+        assert!(
+            !result.to_lowercase().contains("00:50-56:96-aa:33"),
+            "mixed-separator MAC must not survive in clear. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("**-**:**-**:**-ff"),
+            "mask must preserve each separator in place. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("**:**-**:**-**:33"),
+            "mask must preserve each separator in place. Got: {}",
+            result
+        );
+    }
+
+    /// Consistent-separator MACs must render exactly as before #22 touched
+    /// `anonymize_mac_colon` — this fix changes how mixed separators are
+    /// split, not how a single, consistent separator is handled.
+    #[test]
+    fn consistent_separator_mac_unchanged() {
+        assert_eq!(
+            anonymize_mac_colon("00:50:56:96:AA:77"),
+            "**:**:**:**:**:77"
+        );
+        assert_eq!(
+            anonymize_mac_colon("00-50-56-96-AA-77"),
+            "**-**-**-**-**-77"
+        );
+    }
+
+    /// `--exclude mac` must preserve a mixed-separator MAC exactly as typed —
+    /// including its mixed separators — just like it already does for the
+    /// consistent-separator forms in #13.
+    #[test]
+    fn exclude_mac_preserves_mixed_separator_mac() {
+        let content = "A aa-bb:cc-dd:ee-ff B 00:50-56:96-AA:33";
+        let cfg = ExtractConfig::default();
+        let raw = extract_entities(content, &cfg);
+        let exclude = ExcludeFilter::from_strings(&["mac".into()]).unwrap();
+        let map = build_map(raw, &exclude, &cfg);
+        let result = apply_replacements(content, &map, &exclude);
+        assert!(
+            result.contains("aa-bb:cc-dd:ee-ff"),
+            "--exclude mac must preserve the mixed-separator MAC untouched. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("00:50-56:96-AA:33"),
+            "--exclude mac must preserve the mixed-separator MAC untouched. Got: {}",
+            result
+        );
+    }
+
+    /// Sweep technique from #22 itself: a shape-by-shape corpus missed the
+    /// hole three times on this file's MAC/IPv6 hand-off (see
+    /// `every_mac_match_is_claimed_by_exactly_one_channel`), so cross prefix ×
+    /// separator-pattern × suffix instead of hand-picking a few spellings,
+    /// and check that nothing survives in the rendered output. All 2^5 ways
+    /// to alternate `:` and `-` across the five separators between six
+    /// groups, each wrapped in a handful of real-world prefixes and suffixes
+    /// — the same "prefix × form × suffix" cross the issue was measured with.
+    #[test]
+    fn mixed_separator_mac_sweep_leaves_nothing_in_clear() {
+        let groups = ["aa", "bb", "cc", "dd", "ee", "ff"];
+        let prefixes = ["", "Adapter:", "mac:", "fd00::", "Veeam::Backup::"];
+        let suffixes = ["", " end", ": trailing"];
+        let cfg = ExtractConfig::default();
+
+        for pattern in 0u32..32 {
+            let mut mac = String::new();
+            for (i, group) in groups.iter().enumerate() {
+                mac.push_str(group);
+                if i < 5 {
+                    mac.push(if (pattern >> i) & 1 == 0 { ':' } else { '-' });
+                }
+            }
+            for prefix in prefixes {
+                for suffix in suffixes {
+                    let content = format!("{prefix}{mac}{suffix}");
+                    let raw = extract_entities(&content, &cfg);
+                    let map = build_map(raw, &ExcludeFilter::none(), &cfg);
+                    let result = apply_replacements(&content, &map, &ExcludeFilter::none());
+                    assert!(
+                        !result.contains(&mac),
+                        "MAC {mac:?} survived in clear with prefix {prefix:?} and \
+                         suffix {suffix:?}: {result:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// SSH SHA256 fingerprint detected.

@@ -4264,3 +4264,94 @@ fn exclude_mac_preserves_colon_adjacent_shapes() {
         "but the IPv6 must still be masked: {got}"
     );
 }
+
+/// #22: a MAC written with mixed separators (`aa-bb:cc-dd:ee-ff`) matches
+/// `RE_MAC_COLON` — the `[:-]` alternates per separator — but the renderer
+/// used to split on only one of the two characters, undercount the groups,
+/// and give up, shipping the address in clear. `--paranoid` flagged it
+/// (the literal was in `mac_addresses`, mapped to itself), which is the
+/// only reason it wasn't worse. This is the end-to-end proof the leak is
+/// closed: a file containing only mixed-separator MACs must come out
+/// masked, and `--paranoid` must report zero leaks on it.
+#[test]
+fn paranoid_reports_no_leak_on_mixed_separator_macs() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(
+        src.path().join("a.log"),
+        "A aa-bb:cc-dd:ee-ff B 00:50-56:96-AA:33\n",
+    )
+    .unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--paranoid",
+    ]);
+    assert!(o.status.success());
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        !stdout.contains("Leak detected"),
+        "--paranoid must report no leak once mixed-separator MACs are masked. stdout: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Paranoid check") || stdout.contains("no leak"),
+        "Should report a clean paranoid check. stdout: {}",
+        stdout
+    );
+
+    let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+    assert!(
+        !got.contains("aa-bb:cc-dd:ee-ff"),
+        "mixed-separator MAC must not survive in clear: {got}"
+    );
+    assert!(
+        !got.to_lowercase().contains("00:50-56:96-aa:33"),
+        "mixed-separator MAC must not survive in clear: {got}"
+    );
+    assert!(
+        got.contains("**-**:**-**:**-ff"),
+        "mask must preserve each separator in place: {got}"
+    );
+    assert!(
+        got.contains("**:**-**:**-**:33"),
+        "mask must preserve each separator in place: {got}"
+    );
+}
+
+/// `--exclude mac` must preserve a mixed-separator MAC untouched — the same
+/// guarantee it already gives consistent-separator forms.
+#[test]
+fn exclude_mac_preserves_mixed_separator_mac_end_to_end() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(
+        src.path().join("a.log"),
+        "A aa-bb:cc-dd:ee-ff B 00:50-56:96-AA:33\n",
+    )
+    .unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "-e",
+        "mac",
+    ]);
+    assert!(o.status.success());
+    let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+    assert!(
+        got.contains("aa-bb:cc-dd:ee-ff"),
+        "-e mac must preserve the mixed-separator MAC: {got}"
+    );
+    assert!(
+        got.contains("00:50-56:96-AA:33"),
+        "-e mac must preserve the mixed-separator MAC: {got}"
+    );
+}
