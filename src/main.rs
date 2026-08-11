@@ -832,7 +832,10 @@ struct Cli {
     reverse: Option<PathBuf>,
 
     /// Re-scan output files after anonymization to detect any leaked entities
-    /// (safety net for false negatives in detection regexes).
+    /// (safety net for false negatives in detection regexes). Skipped whenever
+    /// the INPUT is a `.zip`, whatever the output form — the run says so. To
+    /// paranoid-check a bundle, unpack the archive yourself first and point -d at
+    /// the resulting directory.
     #[arg(long = "paranoid")]
     paranoid: bool,
 
@@ -4760,8 +4763,13 @@ fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i3
     }
 
     if cli.paranoid {
-        eprintln!("\n  ℹ --paranoid is not applied to .zip output in this version (the same");
-        eprintln!("     detection engine is used; extract and re-run with -d to paranoid-check).");
+        eprintln!("\n  ℹ --paranoid is skipped for a .zip input in this version, whatever the");
+        eprintln!("     output form — pointing -o at a directory does not enable it either, since");
+        eprintln!("     the archive is read directly. The same detection engine runs, so the");
+        eprintln!(
+            "     anonymization is identical; only the re-scan is missing. To paranoid-check"
+        );
+        eprintln!("     a bundle, unpack it yourself and run -d against the resulting directory.");
     }
 
     Ok(EXIT_OK)
