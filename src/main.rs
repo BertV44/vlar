@@ -251,6 +251,14 @@ static RE_JWT: LazyLock<Regex> = LazyLock::new(|| {
 /// IPv6 candidate already claimed as a MAC (see #13) — a real IPv6 address
 /// either compresses with `::` or has all 8 hextets, so an unambiguous
 /// 6-group MAC shape can never be a genuine IPv6 match.
+///
+/// The same ambiguity exists one layer up: a bare 16-pair SSH MD5 fingerprint
+/// (`RE_SSH_FP_MD5_BARE`) is sixteen groups of 2 hex digits, and any 8-group
+/// window inside it also satisfies this pattern (up to 8 hextets are
+/// allowed). `extract_entities_of_kind` runs the SSH fingerprint channel
+/// before this one for the same reason (#23) — a genuine IPv6 address can
+/// never be 16 groups long, so an unambiguous 16-group fingerprint shape can
+/// never be a genuine IPv6 match either.
 static RE_IPV6: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:[0-9a-f]{1,4}:){2,7}(?:[0-9a-f]{1,4}|:)(?:%[a-zA-Z0-9_-]+)?\b").unwrap()
 });
@@ -261,7 +269,12 @@ static RE_IPV6: LazyLock<Regex> = LazyLock::new(|| {
 ///     inside a recognized field like "Physical Address."
 ///
 /// The colon form is checked ahead of `RE_IPV6` for exactly this reason —
-/// see the note on `RE_IPV6` and issue #13.
+/// see the note on `RE_IPV6` and issue #13. It is also checked *after* the
+/// SSH fingerprint channel (#23): a MAC's 6-group window can sit anywhere
+/// inside a 16-pair fingerprint (find_iter walks it non-overlapping and
+/// happily reports two 6-group MAC matches back to back — verified with a
+/// probe test while building the #23 fix, not assumed), so the fingerprint
+/// channel has to claim its span first, exactly as IPv6 does.
 static RE_MAC_COLON: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}\b").unwrap());
 
@@ -277,7 +290,33 @@ static RE_SSH_FP_SHA256: LazyLock<Regex> =
 
 /// SSH host key fingerprint — MD5 form (16 hex pairs colon-separated).
 static RE_SSH_FP_MD5: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bMD5:([0-9a-f]{2}:){15}[0-9a-f]{2}\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\bMD5:([0-9a-f]{2}:){15}[0-9a-f]{2}\b").unwrap());
+
+/// SSH host key fingerprint — MD5 form *without* the `MD5:` tag (#23). Some
+/// callers print the bare 16-pair hex string with no algorithm prefix, e.g. a
+/// fingerprint copied out of `known_hosts` handling or an SSH client that
+/// only logs the digest.
+///
+/// False-positive call: a 16-pair colon-hex run (exactly 2 hex digits per
+/// group, exactly 16 groups) has no legitimate owner other than an MD5-sized
+/// digest rendered in the conventional way. It cannot be a MAC (exactly 6
+/// groups) or a genuine IPv6 address (at most 8 hextets — see the note on
+/// `RE_IPV6`), so unlike those two there is no real ambiguity to resolve by
+/// context; claiming this shape unconditionally, the same way the `MD5:`-
+/// prefixed form already does, is a deliberate choice to over-redact a rare
+/// look-alike rather than under-redact a real fingerprint. What this does
+/// *not* rule out: a colon run longer than 16 pairs. Leftmost-first claims the
+/// first 16, so what is left over depends on the length — an 18-pair run leaves
+/// two pairs entirely in clear, and a run one pair longer than a real fingerprint
+/// costs that fingerprint its own last pair, since the claimed span is shifted by
+/// the leading pair rather than aligned to the digest. Measured over runs of 14
+/// to 40 pairs the residue is never worse than what v2.7.3 left, and 16- and
+/// 32-pair runs leave nothing, but this is a real gap rather than a purely
+/// theoretical one. Same shape as the tail the MAC/IPv6 hand-off leaves open for
+/// runs longer than either pattern's fixed group count. Not observed in the wild;
+/// tracked rather than fixed here.
+static RE_SSH_FP_MD5_BARE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b([0-9a-f]{2}:){15}[0-9a-f]{2}\b").unwrap());
 
 /// SSH public key — rsa/ed25519/ecdsa with base64 payload.
 static RE_SSH_PUBKEY: LazyLock<Regex> = LazyLock::new(|| {
@@ -799,7 +838,10 @@ struct Cli {
     reverse: Option<PathBuf>,
 
     /// Re-scan output files after anonymization to detect any leaked entities
-    /// (safety net for false negatives in detection regexes).
+    /// (safety net for false negatives in detection regexes). Skipped whenever
+    /// the INPUT is a `.zip`, whatever the output form — the run says so. To
+    /// paranoid-check a bundle, unpack the archive yourself first and point -d at
+    /// the resulting directory.
     #[arg(long = "paranoid")]
     paranoid: bool,
 
@@ -1239,14 +1281,49 @@ fn anonymize_ipv6(ipv6: &str) -> String {
 }
 
 /// Anonymize a colon/hyphen-separated MAC: keep the last byte (last 2 hex).
+///
+/// `RE_MAC_COLON` is `([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}` — the `[:-]`
+/// alternates *per separator*, so one match can freely mix the two, e.g.
+/// `aa-bb:cc-dd:ee-ff`. Picking a single separator up front by asking
+/// whether the string contains a colon anywhere (the previous approach)
+/// then splitting on only that character undercounts the groups for any
+/// mixed match, so the `len == 6` check failed and the MAC shipped in
+/// clear — the whole of #22. Splitting on either character at once handles
+/// a mixed match the same way it handles a consistent one, with no separate
+/// case for "mixed" at all.
+///
+/// The mask keeps each separator exactly where it was rather than forcing
+/// the run to one kind: the point of masking is hiding the address, not the
+/// punctuation, and a support engineer reading `**-**:**-**:**-ff` still
+/// recognizes it as a MAC. Narrowing the regex to reject mixed separators
+/// instead (so it simply stops matching them) was considered and rejected —
+/// that would silence `--paranoid` on exactly this shape too, since an
+/// entity nothing detects is an entity in no map, and an entity in no map
+/// is in no scan list. A flagged leak is recoverable; a silent one is not.
 fn anonymize_mac_colon(mac: &str) -> String {
-    let sep = if mac.contains(':') { ':' } else { '-' };
-    let parts: Vec<&str> = mac.split(sep).collect();
-    if parts.len() == 6 {
-        format!("**{0}**{0}**{0}**{0}**{0}{1}", sep, parts[5])
-    } else {
-        mac.to_string()
+    let mut groups: Vec<&str> = Vec::with_capacity(6);
+    let mut seps: Vec<char> = Vec::with_capacity(5);
+    let mut start = 0;
+    for (i, c) in mac.char_indices() {
+        if c == ':' || c == '-' {
+            groups.push(&mac[start..i]);
+            seps.push(c);
+            start = i + c.len_utf8();
+        }
     }
+    groups.push(&mac[start..]);
+
+    if groups.len() != 6 {
+        return mac.to_string();
+    }
+
+    let mut result = String::with_capacity(mac.len());
+    for sep in &seps {
+        result.push_str("**");
+        result.push(*sep);
+    }
+    result.push_str(groups[5]);
+    result
 }
 
 /// Anonymize a compact 12-hex MAC: keep last 2 hex chars.
@@ -1583,6 +1660,17 @@ fn record_domain_user(
     }
 }
 
+/// True if `[start, end)` overlaps any span in `spans` at all — a byte range
+/// hand-off check, like `mac_spans` below, rather than a check on matched
+/// text. Used for the SSH-fingerprint/MAC and SSH-fingerprint/IPv6 hand-offs
+/// (#23), where the claimed span is a strict superset of the candidate being
+/// checked (an 8-group IPv6 window sits *inside* a 16-pair fingerprint span,
+/// it never equals it), so the exact-tuple check `mac_spans` uses for its own
+/// hand-off doesn't apply here.
+fn spans_contain_overlap(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
+    spans.iter().any(|&(s, e)| start < e && s < end)
+}
+
 /// Extract all entities from plain text content (v2.3 extended).
 fn extract_entities(content: &str, cfg: &ExtractConfig) -> ExtractedEntities {
     extract_entities_of_kind(content, cfg, ContentKind::Plain)
@@ -1684,6 +1772,40 @@ fn extract_entities_of_kind(
 
     // ─── v2.4 detections ───────────────────────────────────────────
 
+    // SSH MD5 fingerprints — deliberately extracted BEFORE both MAC and IPv6
+    // (#23). A bare 16-pair colon-hex fingerprint contains 6-group windows
+    // that satisfy `RE_MAC_COLON` and 8-group windows that satisfy `RE_IPV6`
+    // — verified with a probe, not assumed, while building this fix: on
+    // `ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89`, `RE_MAC_COLON` alone
+    // reports two 6-group MAC matches (groups 1-6 and 7-12) and `RE_IPV6`
+    // reports two 8-group matches (1-8 and 9-16), so *both* channels would
+    // carve up the same fingerprint from underneath this one if it ran after
+    // them — exactly the "partly masked, partly clear" bug in #23, one layer
+    // below the MAC/IPv6 boundary in #13. Recording the spans this channel
+    // claims, and having MAC/IPv6 check them, is the same positional
+    // hand-off #13 uses rather than a fresh mechanism.
+    let mut ssh_spans: Vec<(usize, usize)> = Vec::new();
+
+    // `MD5:`-prefixed form first: unambiguous, always the right owner.
+    for m in RE_SSH_FP_MD5.find_iter(content) {
+        ssh_spans.push((m.start(), m.end()));
+        out.ssh_fps.insert(m.as_str().to_string());
+    }
+
+    // Bare form (no `MD5:` tag) — the actual #23 gap. Every `MD5:`-prefixed
+    // match's 16-pair tail also satisfies this pattern on its own (`\b` holds
+    // right after the `:` in "MD5:"), so a bare candidate fully inside a span
+    // already claimed above is that tail, not a second fingerprint; skip it
+    // instead of double-counting the same bytes under two map entries.
+    for m in RE_SSH_FP_MD5_BARE.find_iter(content) {
+        let (start, end) = (m.start(), m.end());
+        if ssh_spans.iter().any(|&(s, e)| s <= start && end <= e) {
+            continue;
+        }
+        ssh_spans.push((start, end));
+        out.ssh_fps.insert(m.as_str().to_string());
+    }
+
     // MAC addresses (colon/hyphen format) — deliberately extracted BEFORE
     // IPv6. A colon-separated MAC (`00:50:56:96:AA:77`) is six groups of
     // exactly two hex digits, which is also a syntactically valid match for
@@ -1707,6 +1829,12 @@ fn extract_entities_of_kind(
 
     for m in RE_MAC_COLON.find_iter(content) {
         let matched = m.as_str();
+        // Claimed by the SSH fingerprint channel above (#23) — a 6-group
+        // window landing inside a 16-pair fingerprint span. Back off
+        // entirely rather than mask a slice of the fingerprint as a MAC.
+        if spans_contain_overlap(&ssh_spans, m.start(), m.end()) {
+            continue;
+        }
         // Stand aside only when the IPv6 channel will demonstrably take this match.
         // All three conditions are load-bearing:
         //
@@ -1770,6 +1898,14 @@ fn extract_entities_of_kind(
         if mac_spans.binary_search(&(m.start(), m.end())).is_ok() {
             continue;
         }
+        // Claimed by the SSH fingerprint channel above (#23) — an 8-group
+        // window landing inside a 16-pair fingerprint span. Unlike the MAC
+        // check above this can't be an exact-span match (the fingerprint
+        // span is always longer than any IPv6 candidate inside it), so this
+        // is a containment check rather than an equality one.
+        if spans_contain_overlap(&ssh_spans, m.start(), m.end()) {
+            continue;
+        }
         if should_anonymize_ipv6(s) {
             out.ipv6s.insert(s.to_string());
         }
@@ -1787,11 +1923,13 @@ fn extract_entities_of_kind(
         }
     }
 
-    // SSH fingerprints (SHA256, MD5, public keys)
+    // SSH fingerprints — SHA256 and public-key forms. The MD5 forms (both
+    // `MD5:`-prefixed and bare) are extracted earlier, ahead of MAC/IPv6 —
+    // see `ssh_spans` above and #23. SHA256's payload is base64 with no
+    // colons and the public-key forms use a `ssh-*`/`ecdsa-*` tag, so
+    // neither one overlaps the MAC/IPv6 colon-hex shape and there's nothing
+    // for either of those channels to race with here.
     for m in RE_SSH_FP_SHA256.find_iter(content) {
-        out.ssh_fps.insert(m.as_str().to_string());
-    }
-    for m in RE_SSH_FP_MD5.find_iter(content) {
         out.ssh_fps.insert(m.as_str().to_string());
     }
     for m in RE_SSH_PUBKEY.find_iter(content) {
@@ -4631,8 +4769,13 @@ fn run_zip(cli: &Cli, exclude: &ExcludeFilter, cfg: &ExtractConfig) -> Result<i3
     }
 
     if cli.paranoid {
-        eprintln!("\n  ℹ --paranoid is not applied to .zip output in this version (the same");
-        eprintln!("     detection engine is used; extract and re-run with -d to paranoid-check).");
+        eprintln!("\n  ℹ --paranoid is skipped for a .zip input in this version, whatever the");
+        eprintln!("     output form — pointing -o at a directory does not enable it either, since");
+        eprintln!("     the archive is read directly. The same detection engine runs, so the");
+        eprintln!(
+            "     anonymization is identical; only the re-scan is missing. To paranoid-check"
+        );
+        eprintln!("     a bundle, unpack it yourself and run -d against the resulting directory.");
     }
 
     Ok(EXIT_OK)
@@ -5240,6 +5383,105 @@ mod tests {
                     "{matched:?} in {text:?} was claimed by neither channel — it would \
                      ship in clear, and --paranoid cannot see it because an entity in \
                      no map is in no scan list"
+                );
+            }
+        }
+    }
+
+    /// Sibling of `every_mac_match_is_claimed_by_exactly_one_channel`, for the
+    /// overlap one layer up (#23): a bare 16-pair SSH MD5 fingerprint contains
+    /// 8-group windows that satisfy `RE_IPV6` and 6-group windows that satisfy
+    /// `RE_MAC_COLON`, the same hazard shape as the MAC/IPv6 boundary. Unlike
+    /// that pair, there is only one correct owner here — a 16-group run can
+    /// never be a genuine MAC or IPv6 address — so the invariant is stricter:
+    /// every match must be claimed by the SSH channel *and* no MAC or IPv6
+    /// entry may overlap any part of it. A partial claim by either is exactly
+    /// how the fingerprint used to ship half-masked, half-clear.
+    ///
+    /// Named cases alone are not trusted here — a shape-by-shape corpus is
+    /// what missed the MAC/IPv6 hole three times running (#13) — so this also
+    /// sweeps a prefix × suffix cross product looking for the same kind of
+    /// gap in a boundary nobody named.
+    #[test]
+    fn every_bare_ssh_fp_match_is_claimed_by_ssh_and_nothing_else() {
+        let cfg = ExtractConfig {
+            aggressive: false,
+            user_list: HashSet::new(),
+            hostname_list: HashSet::new(),
+            object_list: HashSet::new(),
+            db_list: HashSet::new(),
+        };
+
+        let fp = "ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89";
+
+        // Named cases: plain, tagged, "::"-adjacent and C++-scope-adjacent
+        // (bridging the #13 MAC/IPv6 hand-off with this one), and alongside a
+        // genuine MAC/IPv6 elsewhere in the same text.
+        let mut cases: Vec<String> = vec![
+            format!("fp {fp} end"),
+            format!("fp2 MD5:{fp} end"),
+            format!("::{fp}"),
+            format!("fd00::{fp}"),
+            format!("Veeam::Backup::{fp}"),
+            format!("mac 00:50:56:96:AA:77 fp {fp} end"),
+            format!("v6 fd00::aa:bb:cc:dd:ee:ff fp {fp} end"),
+            format!("{fp}: trailing"),
+        ];
+
+        // prefix × suffix cross product around the bare form.
+        let prefixes = [
+            "",
+            "fp ",
+            "fingerprint: ",
+            "MD5:",
+            "::",
+            "fd00::",
+            "Veeam::Backup::",
+            "id:",
+            "key=",
+        ];
+        let suffixes = ["", " end", ",", ";", ".", " (ok)", ":", "\n"];
+        for prefix in prefixes {
+            for suffix in suffixes {
+                cases.push(format!("{prefix}{fp}{suffix}"));
+            }
+        }
+
+        for text in &cases {
+            let out = extract_entities_of_kind(text, &cfg, ContentKind::Plain);
+            for m in RE_SSH_FP_MD5_BARE.find_iter(text.as_str()) {
+                let matched = m.as_str();
+
+                // Claimed by the SSH channel — either as itself (bare) or as
+                // the tail of a longer `MD5:`-prefixed entry that contains it.
+                let as_ssh = out.ssh_fps.iter().any(|v| v.contains(matched));
+                assert!(
+                    as_ssh,
+                    "{matched:?} in {text:?} was not claimed by the SSH channel \
+                     — it would ship in clear, and --paranoid cannot see it \
+                     because an entity in no map is in no scan list"
+                );
+
+                // Not *also* claimed, in whole or in part, by MAC or IPv6.
+                // Any recorded MAC/IPv6 value that is a substring of this
+                // match is a window carved out of the fingerprint — the exact
+                // failure mode #23 reports. (A value from elsewhere in the
+                // same text, like the genuine MAC/IPv6 in two of the cases
+                // above, uses different hex digits and can never be a
+                // substring of `fp`.)
+                let mac_overlap = out.macs_colon.iter().any(|v| matched.contains(v.as_str()));
+                let ipv6_overlap = out.ipv6s.iter().any(|v| matched.contains(v.as_str()));
+                assert!(
+                    !mac_overlap,
+                    "{matched:?} in {text:?} was ALSO claimed in part by the MAC \
+                     channel: {:?}",
+                    out.macs_colon
+                );
+                assert!(
+                    !ipv6_overlap,
+                    "{matched:?} in {text:?} was ALSO claimed in part by the IPv6 \
+                     channel: {:?}",
+                    out.ipv6s
                 );
             }
         }
@@ -6066,6 +6308,139 @@ mod tests {
             "MAC must still get the MAC mask. Got: {}",
             result
         );
+    }
+
+    /// #22: `RE_MAC_COLON` alternates `[:-]` per separator, so a single match
+    /// can mix the two. `anonymize_mac_colon` used to pick one separator by
+    /// asking whether the whole string contained a colon anywhere, then split
+    /// on only that character — a mixed match undercounted its groups and
+    /// came back unchanged, in clear. Several spellings, each masked with
+    /// every separator preserved in place.
+    #[test]
+    fn mixed_separator_mac_masked_with_separators_preserved() {
+        let cases = [
+            ("aa-bb:cc-dd:ee-ff", "**-**:**-**:**-ff"),
+            ("00:50-56:96-AA:33", "**:**-**:**-**:33"),
+            ("00:50-56-96-AA:33", "**:**-**-**-**:33"),
+            ("aa:bb:cc:dd-ee-ff", "**:**:**:**-**-ff"),
+            ("aa-bb-cc-dd-ee:ff", "**-**-**-**-**:ff"),
+        ];
+        for (mac, expected) in cases {
+            assert_eq!(
+                anonymize_mac_colon(mac),
+                expected,
+                "mixed-separator MAC {mac:?} masked wrong"
+            );
+        }
+    }
+
+    /// Same shapes, end to end: the raw mixed-separator MAC must not survive
+    /// in the output, and the mask must land with every separator preserved
+    /// — not just the unit-level render function in isolation.
+    #[test]
+    fn mixed_separator_mac_masked_end_to_end() {
+        let content = "A aa-bb:cc-dd:ee-ff B 00:50-56:96-AA:33";
+        let cfg = ExtractConfig::default();
+        let raw = extract_entities(content, &cfg);
+        let map = build_map(raw, &ExcludeFilter::none(), &cfg);
+        let result = apply_replacements(content, &map, &ExcludeFilter::none());
+        assert!(
+            !result.contains("aa-bb:cc-dd:ee-ff"),
+            "mixed-separator MAC must not survive in clear. Got: {}",
+            result
+        );
+        assert!(
+            !result.to_lowercase().contains("00:50-56:96-aa:33"),
+            "mixed-separator MAC must not survive in clear. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("**-**:**-**:**-ff"),
+            "mask must preserve each separator in place. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("**:**-**:**-**:33"),
+            "mask must preserve each separator in place. Got: {}",
+            result
+        );
+    }
+
+    /// Consistent-separator MACs must render exactly as before #22 touched
+    /// `anonymize_mac_colon` — this fix changes how mixed separators are
+    /// split, not how a single, consistent separator is handled.
+    #[test]
+    fn consistent_separator_mac_unchanged() {
+        assert_eq!(
+            anonymize_mac_colon("00:50:56:96:AA:77"),
+            "**:**:**:**:**:77"
+        );
+        assert_eq!(
+            anonymize_mac_colon("00-50-56-96-AA-77"),
+            "**-**-**-**-**-77"
+        );
+    }
+
+    /// `--exclude mac` must preserve a mixed-separator MAC exactly as typed —
+    /// including its mixed separators — just like it already does for the
+    /// consistent-separator forms in #13.
+    #[test]
+    fn exclude_mac_preserves_mixed_separator_mac() {
+        let content = "A aa-bb:cc-dd:ee-ff B 00:50-56:96-AA:33";
+        let cfg = ExtractConfig::default();
+        let raw = extract_entities(content, &cfg);
+        let exclude = ExcludeFilter::from_strings(&["mac".into()]).unwrap();
+        let map = build_map(raw, &exclude, &cfg);
+        let result = apply_replacements(content, &map, &exclude);
+        assert!(
+            result.contains("aa-bb:cc-dd:ee-ff"),
+            "--exclude mac must preserve the mixed-separator MAC untouched. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("00:50-56:96-AA:33"),
+            "--exclude mac must preserve the mixed-separator MAC untouched. Got: {}",
+            result
+        );
+    }
+
+    /// Sweep technique from #22 itself: a shape-by-shape corpus missed the
+    /// hole three times on this file's MAC/IPv6 hand-off (see
+    /// `every_mac_match_is_claimed_by_exactly_one_channel`), so cross prefix ×
+    /// separator-pattern × suffix instead of hand-picking a few spellings,
+    /// and check that nothing survives in the rendered output. All 2^5 ways
+    /// to alternate `:` and `-` across the five separators between six
+    /// groups, each wrapped in a handful of real-world prefixes and suffixes
+    /// — the same "prefix × form × suffix" cross the issue was measured with.
+    #[test]
+    fn mixed_separator_mac_sweep_leaves_nothing_in_clear() {
+        let groups = ["aa", "bb", "cc", "dd", "ee", "ff"];
+        let prefixes = ["", "Adapter:", "mac:", "fd00::", "Veeam::Backup::"];
+        let suffixes = ["", " end", ": trailing"];
+        let cfg = ExtractConfig::default();
+
+        for pattern in 0u32..32 {
+            let mut mac = String::new();
+            for (i, group) in groups.iter().enumerate() {
+                mac.push_str(group);
+                if i < 5 {
+                    mac.push(if (pattern >> i) & 1 == 0 { ':' } else { '-' });
+                }
+            }
+            for prefix in prefixes {
+                for suffix in suffixes {
+                    let content = format!("{prefix}{mac}{suffix}");
+                    let raw = extract_entities(&content, &cfg);
+                    let map = build_map(raw, &ExcludeFilter::none(), &cfg);
+                    let result = apply_replacements(&content, &map, &ExcludeFilter::none());
+                    assert!(
+                        !result.contains(&mac),
+                        "MAC {mac:?} survived in clear with prefix {prefix:?} and \
+                         suffix {suffix:?}: {result:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// SSH SHA256 fingerprint detected.

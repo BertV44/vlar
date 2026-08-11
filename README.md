@@ -42,7 +42,7 @@ This tool's detection scope follows the categories listed in [KB2462](https://ww
 | Names of backup files | ✅ |
 | SharePoint / Exchange / SQL / Oracle / PostgreSQL / MongoDB / SAP HANA | 🟡 DB names via `--db-list` |
 | Query execution results | ❌ out of scope (would corrupt logs) |
-| SSH host fingerprints | ✅ SHA256, MD5, ssh-rsa/ed25519/ecdsa public keys |
+| SSH host fingerprints | ✅ SHA256, MD5 (tagged **and** bare 16-pair form), ssh-rsa/ed25519/ecdsa public keys |
 | SSH connection type | ❌ not sensitive |
 | SSH scripts/commands output | ❌ not delimitable reliably |
 | PEM certificates / private keys / JWT | ✅ |
@@ -152,6 +152,47 @@ therefore always an escape, but `RE_DOMAIN_USER` read `col1\tsep2` as domain `co
 left `--paranoid` reporting phantom leaks. Single-backslash escapes (`\b \f \n \r \t \uXXXX`) are
 no longer treated as `DOMAIN\user` in JSON-encoded content. Plain-text `.log` detection is
 unchanged.
+
+## What's new in v2.7.4
+
+Two detection defects that reached the output, and one documentation gap.
+
+### MAC addresses with mixed separators are no longer written in clear (#22)
+
+`RE_MAC_COLON` alternates `:` and `-` *per separator*, so it matches `aa-bb:cc-dd:ee-ff` as one
+address — but the masking picked a single separator, split on that alone, got fewer than six groups
+and returned the input untouched. Detection was right; only rendering was broken, so the address
+shipped in clear. Across 1280 generated contexts (all 32 separator patterns × 8 prefixes × 5
+suffixes), v2.7.3 leaves 1200 MAC literals in the output; v2.7.4 leaves none.
+
+The mask now keeps each separator where it was: `aa-bb:cc-dd:ee-ff` → `**-**:**-**:**-ff`.
+Consistent-separator forms are byte-identical to v2.7.3.
+
+The alternative — narrowing the pattern so mixed forms stop matching — was rejected. An undetected
+entity is in no map, and `--paranoid` only scans literals it already knows about, so the tool would
+have gone *silent* on exactly this shape. A flagged leak beats a silent miss.
+
+### Bare SSH MD5 fingerprints are redacted rather than carved up (#23)
+
+A 16-pair hex fingerprint written without the `MD5:` tag was being taken apart by both other
+channels — spurious MAC matches and spurious IPv6 matches — and came out as a run of IPv6 masks with
+fragments of the original still visible. It was in no SSH map, so `--exclude ssh-fp` could not
+preserve it either.
+
+Both MD5 forms are now claimed before the MAC and IPv6 passes, which back off where they overlap.
+A 16-pair run can be neither a MAC (exactly six groups) nor an IPv6 (at most eight hextets), so
+there is no other legitimate owner.
+
+```
+before:  ****:****:****:****:****:****:****:89:****:…:89
+after:   [REDACTED SSH KEY]
+```
+
+### `--paranoid` and `.zip` input (#17)
+
+`--paranoid` is skipped whenever the **input** is a `.zip` — not only when the output is one — and
+that was documented nowhere while two other recommendations pointed straight at it. See
+[the caveat](#--paranoid-is-skipped-for-zip-input) below.
 
 ## What's new in v2.7.3
 
@@ -417,7 +458,8 @@ veeam-log-anonymizer -d bundle.zip --validate-only --report-output audit.json
 Point `-d` at a support `.zip` directly (auto-detected by extension / PK magic bytes) — no
 manual decompression.
 
-- `--output-zip FILE` repacks an anonymized `.zip` (what you send back to support), preserving
+- `--output-zip FILE` repacks an anonymized `.zip` (what you send back to support) — note that
+  `--paranoid` does **not** re-scan it, see the caveat just before the recommended workflow — preserving
   the internal tree and entry timestamps. Otherwise the bundle is extracted, anonymized, into
   `-o DIR`.
 - `.log` entries get their content anonymized; other entries are copied byte-for-byte; **every
@@ -476,7 +518,7 @@ Major coverage upgrade aligned with [Veeam KB2462](https://www.veeam.com/kb2462)
 
 - **IPv6 addresses** detected and anonymized (preserves loopback, link-local, multicast)
 - **MAC addresses** in both colon (`XX:XX:XX:XX:XX:XX`) and compact (`XXXXXXXXXXXX`) formats
-- **SSH host fingerprints**: SHA256, MD5, and full ssh-rsa/ed25519/ecdsa public keys
+- **SSH host fingerprints**: SHA256, MD5 (both `MD5:`-tagged and the bare 16-pair form), and full ssh-rsa/ed25519/ecdsa public keys
 - **Backup file names** (.vbk/.vib/.vbm/.vrb): stem replaced, extension preserved
 - **PEM inline** (JSON-escaped `\n` between BEGIN/END): now properly redacted (was missed in v2.3)
 - **`--hostname-list FILE`**: explicit list of short hostnames to anonymize
@@ -609,7 +651,7 @@ veeam-log-anonymizer -d ./logs -o ./output -f -e email
 |  | `--validate-only` | Scan only; emit JSON report (exit 0/2); writes nothing |
 |  | `--report-output FILE` | Write the `--validate-only` JSON report to a file |
 |  | `--reverse FILE` | De-anonymize using dictionary JSON (decrypts `.age` transparently) |
-|  | `--paranoid` | Re-scan output files to detect any leaked entities |
+|  | `--paranoid` | Re-scan output files to detect any leaked entities (**skipped for `.zip` input** — see below) |
 |  | `--aggressive` | Enable detection of standalone FQDNs and naked usernames |
 |  | `--user-list FILE` | Explicit list of usernames |
 |  | `--hostname-list FILE` | Explicit list of short hostnames |
@@ -662,7 +704,8 @@ therefore interact:
 | **MAC** (colon) | `00:50:56:96:AA:77` | `**:**:**:**:**:77` |
 | **MAC** (compact) | `005056962A77` | `**********77` |
 | **SSH SHA256** | `SHA256:abc...xyz=` | `SHA256:[REDACTED]` |
-| **SSH MD5** | `MD5:ab:cd:...` | `MD5:[REDACTED]` |
+| **SSH MD5 (tagged)** | `MD5:ab:cd:...` | `MD5:[REDACTED]` |
+| **SSH MD5 (bare)** | `ab:cd:ef:…:89` (16 pairs, no tag) | `[REDACTED SSH KEY]` |
 | **SSH pubkey** | `ssh-rsa AAAA...` | `ssh-rsa [REDACTED]` |
 | **Backup files** | `Job-CRM-2026-05-17.vbk` | `xR4t9pZmK9Lq.vbk` |
 | PEM certificates | full block | `BEGIN/END preserved, body redacted` |
@@ -697,6 +740,35 @@ therefore interact:
 - System accounts (SYSTEM, Administrator, LocalService, etc.)
 - Technical terms and Veeam service names
 
+### `--paranoid` is skipped for `.zip` input
+
+`--paranoid` is skipped whenever the **input** is a `.zip` — not just when the output is one. The
+archive is read directly, so pointing `-o` at a directory does not enable the re-scan either. The run
+says so at the time:
+
+```
+  ℹ --paranoid is skipped for a .zip input in this version, whatever the
+     output form — pointing -o at a directory does not enable it either, since
+     the archive is read directly. The same detection engine runs, so the
+     anonymization is identical; only the re-scan is missing. To paranoid-check
+     a bundle, unpack it yourself and run -d against the resulting directory.
+```
+
+This matters because two recommendations elsewhere pull against each other: `--output-zip` is
+described above as the thing you send back to support, and the workflow below tells you to verify
+`--paranoid` reports zero leaks. Combining them does not give you the safety net you would expect.
+
+The route that does work is to unpack the archive with your own tool first:
+
+```bash
+mkdir bundle-extracted && (cd bundle-extracted && unzip -q ../bundle.zip)
+veeam-log-anonymizer -d ./bundle-extracted -o ./anonymized -f --aggressive --paranoid
+# review the report, then zip ./anonymized yourself
+```
+
+The same detection engine runs either way, so the anonymization itself is identical — what differs
+is only whether the result is re-scanned afterwards.
+
 ## Recommended support workflow
 
 ```bash
@@ -712,6 +784,8 @@ veeam-log-anonymizer \
 
 # 2. Verify --paranoid reports zero leaks. If not, review and re-run.
 #    Add the leaked entries to the appropriate list and re-run.
+#    NOTE: --paranoid is skipped whenever the INPUT is a .zip, whatever -o is.
+#    Unpack the bundle yourself first if you need the re-scan; see the caveat.
 
 # 3. Bundle and send ONLY the ./anonymized directory to support.
 #    Do NOT include the dictionary file.
