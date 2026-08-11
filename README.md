@@ -417,7 +417,8 @@ veeam-log-anonymizer -d bundle.zip --validate-only --report-output audit.json
 Point `-d` at a support `.zip` directly (auto-detected by extension / PK magic bytes) — no
 manual decompression.
 
-- `--output-zip FILE` repacks an anonymized `.zip` (what you send back to support), preserving
+- `--output-zip FILE` repacks an anonymized `.zip` (what you send back to support) — note that
+  `--paranoid` does **not** re-scan it, see the caveat under the recommended workflow — preserving
   the internal tree and entry timestamps. Otherwise the bundle is extracted, anonymized, into
   `-o DIR`.
 - `.log` entries get their content anonymized; other entries are copied byte-for-byte; **every
@@ -609,7 +610,7 @@ veeam-log-anonymizer -d ./logs -o ./output -f -e email
 |  | `--validate-only` | Scan only; emit JSON report (exit 0/2); writes nothing |
 |  | `--report-output FILE` | Write the `--validate-only` JSON report to a file |
 |  | `--reverse FILE` | De-anonymize using dictionary JSON (decrypts `.age` transparently) |
-|  | `--paranoid` | Re-scan output files to detect any leaked entities |
+|  | `--paranoid` | Re-scan output files to detect any leaked entities (**skipped for `.zip` input** — see below) |
 |  | `--aggressive` | Enable detection of standalone FQDNs and naked usernames |
 |  | `--user-list FILE` | Explicit list of usernames |
 |  | `--hostname-list FILE` | Explicit list of short hostnames |
@@ -697,6 +698,35 @@ therefore interact:
 - System accounts (SYSTEM, Administrator, LocalService, etc.)
 - Technical terms and Veeam service names
 
+### `--paranoid` does not cover `.zip` output
+
+`--paranoid` is skipped whenever the **input** is a `.zip` — not just when the output is one. The
+archive is read directly, so pointing `-o` at a directory does not enable the re-scan either. The run
+says so at the time:
+
+```
+  ℹ --paranoid is skipped for a .zip input in this version, whatever the
+     output form — pointing -o at a directory does not enable it either, since
+     the archive is read directly. The same detection engine runs, so the
+     anonymization is identical; only the re-scan is missing. To paranoid-check
+     a bundle, unpack it yourself and run -d against the resulting directory.
+```
+
+This matters because two recommendations elsewhere pull against each other: `--output-zip` is
+described above as the thing you send back to support, and the workflow below tells you to verify
+`--paranoid` reports zero leaks. Combining them does not give you the safety net you would expect.
+
+The route that does work is to unpack the archive with your own tool first:
+
+```bash
+mkdir bundle-extracted && (cd bundle-extracted && unzip -q ../bundle.zip)
+veeam-log-anonymizer -d ./bundle-extracted -o ./anonymized -f --aggressive --paranoid
+# review the report, then zip ./anonymized yourself
+```
+
+The same detection engine runs either way, so the anonymization itself is identical — what differs
+is only whether the result is re-scanned afterwards.
+
 ## Recommended support workflow
 
 ```bash
@@ -712,6 +742,8 @@ veeam-log-anonymizer \
 
 # 2. Verify --paranoid reports zero leaks. If not, review and re-run.
 #    Add the leaked entries to the appropriate list and re-run.
+#    NOTE: --paranoid is skipped whenever the INPUT is a .zip, whatever -o is.
+#    Unpack the bundle yourself first if you need the re-scan; see the caveat.
 
 # 3. Bundle and send ONLY the ./anonymized directory to support.
 #    Do NOT include the dictionary file.

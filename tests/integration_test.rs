@@ -4264,3 +4264,86 @@ fn exclude_mac_preserves_colon_adjacent_shapes() {
         "but the IPv6 must still be masked: {got}"
     );
 }
+
+/// `--paranoid` is skipped for a `.zip` input whatever the output form, and the run
+/// has to say so — the documented workflow tells the operator to rely on the
+/// re-scan, and `--output-zip` is described as the thing they send to support, so
+/// silence here would promise a safety net that is not there.
+#[test]
+fn paranoid_says_it_is_skipped_for_zip_input() {
+    let dir = TempDir::new().unwrap();
+    let in_zip = dir.path().join("bundle.zip");
+    make_zip(&in_zip, &[("a.log", "x erin@corp.com\n")]);
+
+    // Both output forms, because the discriminator is the input, not the output —
+    // which is the misreading the old wording invited.
+    let out_zip = dir.path().join("anon.zip");
+    let out_dir = TempDir::new().unwrap();
+    for args in [
+        vec![
+            "-d",
+            in_zip.to_str().unwrap(),
+            "--output-zip",
+            out_zip.to_str().unwrap(),
+            "-f",
+            "--paranoid",
+        ],
+        vec![
+            "-d",
+            in_zip.to_str().unwrap(),
+            "-o",
+            out_dir.path().to_str().unwrap(),
+            "-f",
+            "--paranoid",
+        ],
+    ] {
+        let o = run(&args);
+        assert!(
+            o.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(
+            all.contains("skipped for a .zip input"),
+            "the limitation must be stated for {args:?}: {all}"
+        );
+        assert!(
+            !all.contains("Paranoid check:"),
+            "it must not claim to have run for {args:?}: {all}"
+        );
+    }
+}
+
+/// And the documented alternative has to work: unpack the archive yourself, then
+/// point `-d` at the directory.
+#[test]
+fn paranoid_works_on_an_unpacked_bundle() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(src.path().join("a.log"), "x erin@corp.com\n").unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "--aggressive",
+        "--paranoid",
+    ]);
+    assert!(o.status.success());
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        all.contains("Paranoid check:"),
+        "a directory input must still be re-scanned: {all}"
+    );
+}
