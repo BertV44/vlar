@@ -4667,3 +4667,79 @@ fn paranoid_works_on_an_unpacked_bundle() {
         "a directory input must still be re-scanned: {all}"
     );
 }
+
+/// Fingerprint casing is a separate corpus trap: a lowercase fingerprint elsewhere
+/// in the same file covers an uppercase one, because the replacement matcher is
+/// case-insensitive even when the detection pattern is not. Isolated, an uppercase
+/// bare fingerprint was still carved up by the MAC and IPv6 channels — the silent
+/// miss `--paranoid` cannot see, since the entity is in no map.
+#[test]
+fn ssh_md5_fingerprints_are_redacted_in_any_case() {
+    for (label, line) in [
+        (
+            "upper",
+            "UP B6:C9:CE:A4:9D:55:B0:F8:89:E1:28:F4:83:55:55:90 end\n",
+        ),
+        (
+            "mixed",
+            "MX aB:Cd:eF:01:23:45:67:89:Ab:cD:Ef:01:23:45:67:89 end\n",
+        ),
+        (
+            "lower",
+            "LO ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:80 end\n",
+        ),
+        (
+            "tagged-upper",
+            "TG MD5:B6:C9:CE:A4:9D:55:B0:F8:89:E1:28:F4:83:55:55:91 end\n",
+        ),
+    ] {
+        // One casing per file, deliberately: a sibling in another case would mask
+        // the defect through the case-insensitive replacement pass.
+        let src = TempDir::new().unwrap();
+        let out = TempDir::new().unwrap();
+        fs::write(src.path().join("a.log"), line).unwrap();
+
+        let o = run(&[
+            "-d",
+            src.path().to_str().unwrap(),
+            "-o",
+            out.path().to_str().unwrap(),
+            "-f",
+        ]);
+        assert!(o.status.success());
+        let got = fs::read_to_string(out.path().join("a.log")).unwrap();
+        assert!(
+            got.contains("[REDACTED"),
+            "{label} fingerprint must be redacted, got: {got}"
+        );
+        assert!(
+            !got.contains(":F8:") && !got.contains(":89:"),
+            "{label} fingerprint was carved up instead of redacted: {got}"
+        );
+    }
+}
+
+/// And `--exclude ssh-fp` has to preserve every casing too.
+#[test]
+fn exclude_ssh_fp_preserves_any_case() {
+    let src = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let raw = "UP B6:C9:CE:A4:9D:55:B0:F8:89:E1:28:F4:83:55:55:90 end\n";
+    fs::write(src.path().join("a.log"), raw).unwrap();
+
+    let o = run(&[
+        "-d",
+        src.path().to_str().unwrap(),
+        "-o",
+        out.path().to_str().unwrap(),
+        "-f",
+        "-e",
+        "ssh-fp",
+    ]);
+    assert!(o.status.success());
+    assert_eq!(
+        fs::read_to_string(out.path().join("a.log")).unwrap(),
+        raw,
+        "an excluded fingerprint must survive byte-for-byte whatever its case"
+    );
+}

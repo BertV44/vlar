@@ -42,7 +42,7 @@ This tool's detection scope follows the categories listed in [KB2462](https://ww
 | Names of backup files | ✅ |
 | SharePoint / Exchange / SQL / Oracle / PostgreSQL / MongoDB / SAP HANA | 🟡 DB names via `--db-list` |
 | Query execution results | ❌ out of scope (would corrupt logs) |
-| SSH host fingerprints | ✅ SHA256, MD5, ssh-rsa/ed25519/ecdsa public keys |
+| SSH host fingerprints | ✅ SHA256, MD5 (tagged **and** bare 16-pair form), ssh-rsa/ed25519/ecdsa public keys |
 | SSH connection type | ❌ not sensitive |
 | SSH scripts/commands output | ❌ not delimitable reliably |
 | PEM certificates / private keys / JWT | ✅ |
@@ -192,7 +192,7 @@ after:   [REDACTED SSH KEY]
 
 `--paranoid` is skipped whenever the **input** is a `.zip` — not only when the output is one — and
 that was documented nowhere while two other recommendations pointed straight at it. See
-[the caveat](#--paranoid-does-not-cover-zip-output) above.
+[the caveat](#--paranoid-is-skipped-for-zip-input) below.
 
 ## What's new in v2.7.3
 
@@ -459,7 +459,7 @@ Point `-d` at a support `.zip` directly (auto-detected by extension / PK magic b
 manual decompression.
 
 - `--output-zip FILE` repacks an anonymized `.zip` (what you send back to support) — note that
-  `--paranoid` does **not** re-scan it, see the caveat under the recommended workflow — preserving
+  `--paranoid` does **not** re-scan it, see the caveat just before the recommended workflow — preserving
   the internal tree and entry timestamps. Otherwise the bundle is extracted, anonymized, into
   `-o DIR`.
 - `.log` entries get their content anonymized; other entries are copied byte-for-byte; **every
@@ -518,7 +518,7 @@ Major coverage upgrade aligned with [Veeam KB2462](https://www.veeam.com/kb2462)
 
 - **IPv6 addresses** detected and anonymized (preserves loopback, link-local, multicast)
 - **MAC addresses** in both colon (`XX:XX:XX:XX:XX:XX`) and compact (`XXXXXXXXXXXX`) formats
-- **SSH host fingerprints**: SHA256, MD5, and full ssh-rsa/ed25519/ecdsa public keys
+- **SSH host fingerprints**: SHA256, MD5 (both `MD5:`-tagged and the bare 16-pair form), and full ssh-rsa/ed25519/ecdsa public keys
 - **Backup file names** (.vbk/.vib/.vbm/.vrb): stem replaced, extension preserved
 - **PEM inline** (JSON-escaped `\n` between BEGIN/END): now properly redacted (was missed in v2.3)
 - **`--hostname-list FILE`**: explicit list of short hostnames to anonymize
@@ -704,7 +704,8 @@ therefore interact:
 | **MAC** (colon) | `00:50:56:96:AA:77` | `**:**:**:**:**:77` |
 | **MAC** (compact) | `005056962A77` | `**********77` |
 | **SSH SHA256** | `SHA256:abc...xyz=` | `SHA256:[REDACTED]` |
-| **SSH MD5** | `MD5:ab:cd:...` | `MD5:[REDACTED]` |
+| **SSH MD5 (tagged)** | `MD5:ab:cd:...` | `MD5:[REDACTED]` |
+| **SSH MD5 (bare)** | `ab:cd:ef:…:89` (16 pairs, no tag) | `[REDACTED SSH KEY]` |
 | **SSH pubkey** | `ssh-rsa AAAA...` | `ssh-rsa [REDACTED]` |
 | **Backup files** | `Job-CRM-2026-05-17.vbk` | `xR4t9pZmK9Lq.vbk` |
 | PEM certificates | full block | `BEGIN/END preserved, body redacted` |
@@ -739,7 +740,7 @@ therefore interact:
 - System accounts (SYSTEM, Administrator, LocalService, etc.)
 - Technical terms and Veeam service names
 
-### `--paranoid` does not cover `.zip` output
+### `--paranoid` is skipped for `.zip` input
 
 `--paranoid` is skipped whenever the **input** is a `.zip` — not just when the output is one. The
 archive is read directly, so pointing `-o` at a directory does not enable the re-scan either. The run

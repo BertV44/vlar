@@ -290,7 +290,7 @@ static RE_SSH_FP_SHA256: LazyLock<Regex> =
 
 /// SSH host key fingerprint — MD5 form (16 hex pairs colon-separated).
 static RE_SSH_FP_MD5: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bMD5:([0-9a-f]{2}:){15}[0-9a-f]{2}\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\bMD5:([0-9a-f]{2}:){15}[0-9a-f]{2}\b").unwrap());
 
 /// SSH host key fingerprint — MD5 form *without* the `MD5:` tag (#23). Some
 /// callers print the bare 16-pair hex string with no algorithm prefix, e.g. a
@@ -305,12 +305,18 @@ static RE_SSH_FP_MD5: LazyLock<Regex> =
 /// context; claiming this shape unconditionally, the same way the `MD5:`-
 /// prefixed form already does, is a deliberate choice to over-redact a rare
 /// look-alike rather than under-redact a real fingerprint. What this does
-/// *not* rule out: a 17-or-more-pair run that happens to butt up against this
-/// pattern with no separating character loses its 17th+ pair to nobody, the
-/// same edge the MAC/IPv6 hand-off leaves open for runs longer than either
-/// pattern's fixed group count — not observed in the wild, not fixed here.
+/// *not* rule out: a colon run longer than 16 pairs. Leftmost-first claims the
+/// first 16, so what is left over depends on the length — an 18-pair run leaves
+/// two pairs entirely in clear, and a run one pair longer than a real fingerprint
+/// costs that fingerprint its own last pair, since the claimed span is shifted by
+/// the leading pair rather than aligned to the digest. Measured over runs of 14
+/// to 40 pairs the residue is never worse than what v2.7.3 left, and 16- and
+/// 32-pair runs leave nothing, but this is a real gap rather than a purely
+/// theoretical one. Same shape as the tail the MAC/IPv6 hand-off leaves open for
+/// runs longer than either pattern's fixed group count. Not observed in the wild;
+/// tracked rather than fixed here.
 static RE_SSH_FP_MD5_BARE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b([0-9a-f]{2}:){15}[0-9a-f]{2}\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\b([0-9a-f]{2}:){15}[0-9a-f]{2}\b").unwrap());
 
 /// SSH public key — rsa/ed25519/ecdsa with base64 payload.
 static RE_SSH_PUBKEY: LazyLock<Regex> = LazyLock::new(|| {
