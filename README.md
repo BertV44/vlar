@@ -153,6 +153,47 @@ left `--paranoid` reporting phantom leaks. Single-backslash escapes (`\b \f \n \
 no longer treated as `DOMAIN\user` in JSON-encoded content. Plain-text `.log` detection is
 unchanged.
 
+## What's new in v2.7.4
+
+Two detection defects that reached the output, and one documentation gap.
+
+### MAC addresses with mixed separators are no longer written in clear (#22)
+
+`RE_MAC_COLON` alternates `:` and `-` *per separator*, so it matches `aa-bb:cc-dd:ee-ff` as one
+address — but the masking picked a single separator, split on that alone, got fewer than six groups
+and returned the input untouched. Detection was right; only rendering was broken, so the address
+shipped in clear. Across 1280 generated contexts (all 32 separator patterns × 8 prefixes × 5
+suffixes), v2.7.3 leaves 1200 MAC literals in the output; v2.7.4 leaves none.
+
+The mask now keeps each separator where it was: `aa-bb:cc-dd:ee-ff` → `**-**:**-**:**-ff`.
+Consistent-separator forms are byte-identical to v2.7.3.
+
+The alternative — narrowing the pattern so mixed forms stop matching — was rejected. An undetected
+entity is in no map, and `--paranoid` only scans literals it already knows about, so the tool would
+have gone *silent* on exactly this shape. A flagged leak beats a silent miss.
+
+### Bare SSH MD5 fingerprints are redacted rather than carved up (#23)
+
+A 16-pair hex fingerprint written without the `MD5:` tag was being taken apart by both other
+channels — spurious MAC matches and spurious IPv6 matches — and came out as a run of IPv6 masks with
+fragments of the original still visible. It was in no SSH map, so `--exclude ssh-fp` could not
+preserve it either.
+
+Both MD5 forms are now claimed before the MAC and IPv6 passes, which back off where they overlap.
+A 16-pair run can be neither a MAC (exactly six groups) nor an IPv6 (at most eight hextets), so
+there is no other legitimate owner.
+
+```
+before:  ****:****:****:****:****:****:****:89:****:…:89
+after:   [REDACTED SSH KEY]
+```
+
+### `--paranoid` and `.zip` input (#17)
+
+`--paranoid` is skipped whenever the **input** is a `.zip` — not only when the output is one — and
+that was documented nowhere while two other recommendations pointed straight at it. See
+[the caveat](#--paranoid-does-not-cover-zip-output) above.
+
 ## What's new in v2.7.3
 
 Three defects where a flag or a report did not do what it said. All three predate v2.7.
